@@ -1,0 +1,64 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
+:root {
+  --ink: #0f2a31;
+  --panel-bg: rgba(255, 255, 255, 0.85);
+  --panel-border: rgba(13, 49, 56, 0.13);
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  line-height: 1.4;
+  font-weight: 500;
+  color: var(--ink);
+  background:
+    linear-gradient(30deg, rgba(2, 203, 209, 0.08) 12%, transparent 12.5%, transparent 87%, rgba(2, 203, 209, 0.08) 87.5%, rgba(2, 203, 209, 0.08)),
+    linear-gradient(150deg, rgba(255, 155, 77, 0.08) 12%, transparent 12.5%, transparent 87%, rgba(255, 155, 77, 0.08) 87.5%, rgba(255, 155, 77, 0.08)),
+    linear-gradient(90deg, rgba(251, 250, 244, 1), rgba(250, 255, 253, 1));
+  background-size: 80px 140px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+input,
+select {
+  border-radius: 10px;
+  border: 1px solid #c6d1d4;
+  padding: 0.58rem 0.7rem;
+  background: #fff;
+}
+
+button {
+  border: 0;
+  border-radius: 10px;
+  background: #123840;
+  color: #fff;
+  padding: 0.58rem 0.8rem;
+  cursor: pointer;
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+#root {
+  width: 100%;
+}

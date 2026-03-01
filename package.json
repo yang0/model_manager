@@ -1,0 +1,20 @@
+{
+  "name": "model-manager",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "frontend",
+    "backend",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev -w backend\" \"npm:dev -w frontend\"",
+    "build": "npm run build -w shared && npm run build -w backend && npm run build -w frontend",
+    "start": "npm run start -w backend",
+    "lint": "npm run lint -ws --if-present",
+    "test": "npm run test -ws --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
