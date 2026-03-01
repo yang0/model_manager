@@ -10,6 +10,7 @@ import {
   importCliproxyConfig,
   refreshEndpoint,
   scoreModels,
+  updateModelEnabled,
   updateFallbackChain,
 } from "./api";
 import type {
@@ -195,6 +196,101 @@ function modelScoreFromMeta(meta?: Record<string, unknown>): string {
   return value === null ? "-" : String(value);
 }
 
+function toBooleanLike(value: unknown): boolean | null {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      return null;
+    }
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+    if (normalized === "true" || normalized === "1" || normalized === "yes") {
+      return true;
+    }
+    if (normalized === "false" || normalized === "0" || normalized === "no") {
+      return false;
+    }
+  }
+  return null;
+}
+
+function getModelStatusView(model: ModelRecord): {
+  title: string;
+  detail: string;
+  tone: "enabled" | "disabled";
+  source: "manual" | "auto";
+} {
+  const meta = model.meta ?? {};
+  const overrideRaw = typeof meta.status_override === "string" ? meta.status_override.trim().toLowerCase() : "";
+  const source: "manual" | "auto" = overrideRaw === "enabled" || overrideRaw === "disabled" ? "manual" : "auto";
+  const quotaLimited = toBooleanLike(meta.quota_limited) === true;
+  const quotaExhausted = toBooleanLike(meta.quota_exhausted) === true;
+  const quotaUnlimited = toBooleanLike(meta.quota_unlimited) === true;
+
+  if (model.enabled) {
+    if (source === "manual") {
+      return {
+        title: "已启用",
+        detail: "手动启用",
+        tone: "enabled",
+        source,
+      };
+    }
+    if (quotaUnlimited) {
+      return {
+        title: "已启用",
+        detail: "自动启用 · 不限量",
+        tone: "enabled",
+        source,
+      };
+    }
+    if (quotaLimited) {
+      return {
+        title: "已启用",
+        detail: "自动启用 · 额度可用",
+        tone: "enabled",
+        source,
+      };
+    }
+    return {
+      title: "已启用",
+      detail: "自动启用",
+      tone: "enabled",
+      source,
+    };
+  }
+
+  if (source === "manual") {
+    return {
+      title: "已禁用",
+      detail: "手动禁用",
+      tone: "disabled",
+      source,
+    };
+  }
+  if (quotaLimited && quotaExhausted) {
+    return {
+      title: "已禁用",
+      detail: "自动禁用 · 额度耗尽",
+      tone: "disabled",
+      source,
+    };
+  }
+  return {
+    title: "已禁用",
+    detail: "自动禁用",
+    tone: "disabled",
+    source,
+  };
+}
+
 function formatTime(value?: string): string {
   if (!value) {
     return "N/A";
@@ -210,6 +306,16 @@ function resolveCliproxyEndpoint(endpoints: EndpointView[]): EndpointView | null
 
 function chainMapFromRows(rows: FallbackChainView[]): Record<string, string[]> {
   return Object.fromEntries(rows.map((row) => [row.modelKey, row.priorityList]));
+}
+
+function chainCurrentMapFromRows(rows: FallbackChainView[]): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    if (typeof row.currentModelId === "string" && row.currentModelId.trim()) {
+      result[row.modelKey] = row.currentModelId.trim();
+    }
+  }
+  return result;
 }
 
 function normalizeVariableKeys(current: ClaudeCurrentState | null, fallbackMap: Record<string, string[]>): string[] {
@@ -231,6 +337,7 @@ function App() {
   const [models, setModels] = useState<ModelRecord[]>([]);
   const [claudeCurrent, setClaudeCurrent] = useState<ClaudeCurrentState | null>(null);
   const [fallbackChains, setFallbackChains] = useState<Record<string, string[]>>({});
+  const [fallbackCurrentByKey, setFallbackCurrentByKey] = useState<Record<string, string>>({});
 
   const [cliproxyConfigInfo, setCliproxyConfigInfo] = useState({
     found: false,
@@ -340,6 +447,7 @@ function App() {
         : [];
 
       const nextFallbackMap = chainMapFromRows(nextFallbackRows);
+      const nextFallbackCurrentMap = chainCurrentMapFromRows(nextFallbackRows);
       const available = new Set(nextModels.map((item) => item.modelId));
       const keys = normalizeVariableKeys(nextCurrent, nextFallbackMap);
 
@@ -354,6 +462,25 @@ function App() {
           nextFallbackMap[key] = [configured];
         }
       }
+      for (const [key, modelId] of Object.entries(nextFallbackCurrentMap)) {
+        if (!available.has(modelId)) {
+          delete nextFallbackCurrentMap[key];
+        }
+      }
+      for (const key of keys) {
+        if (nextFallbackCurrentMap[key]) {
+          continue;
+        }
+        const configured = nextCurrent?.env.modelValues?.[key];
+        if (configured && available.has(configured)) {
+          nextFallbackCurrentMap[key] = configured;
+          continue;
+        }
+        const chainTop = nextFallbackMap[key]?.[0];
+        if (chainTop) {
+          nextFallbackCurrentMap[key] = chainTop;
+        }
+      }
 
       setEndpoint(nextEndpoint);
       setModels(nextModels);
@@ -366,6 +493,7 @@ function App() {
       setClaudeCurrent(nextCurrent);
       setCliproxyConfigInfo(nextCliproxyInfo);
       setFallbackChains(nextFallbackMap);
+      setFallbackCurrentByKey(nextFallbackCurrentMap);
     } catch (error) {
       setError(error);
     } finally {
@@ -471,6 +599,10 @@ function App() {
       ...prev,
       [updated.modelKey]: updated.priorityList,
     }));
+    setFallbackCurrentByKey((prev) => ({
+      ...prev,
+      [updated.modelKey]: updated.currentModelId || updated.priorityList[0] || "",
+    }));
     await loadData(true);
     setSuccess(successText);
   }, [loadData, modelIdSet]);
@@ -565,6 +697,24 @@ function App() {
       setError(error);
     } finally {
       setIsScoringModels(false);
+      setSubmitting(false);
+    }
+  };
+
+  const handleToggleModelEnabled = async (model: ModelRecord) => {
+    setSubmitting(true);
+    try {
+      const updated = await updateModelEnabled(model.id, !model.enabled);
+      setModels((prev) =>
+        prev
+          .map((item) => (item.id === updated.id ? updated : item))
+          .sort((a, b) => a.displayName.localeCompare(b.displayName)),
+      );
+      await loadData(true);
+      setSuccess(`模型 ${updated.modelId} 已${updated.enabled ? "启用" : "禁用"}，并同步了 fallback 配置。`);
+    } catch (error) {
+      setError(error);
+    } finally {
       setSubmitting(false);
     }
   };
@@ -768,6 +918,16 @@ function App() {
         {activeMenu === "home" && (
           <section className="content-card">
             <h2>Claude Code 当前配置</h2>
+            <div className="mechanism-note">
+              <div className="mechanism-title">Fallback Chain 切换机制</div>
+              <ul>
+                <li>每个变量都有独立 chain，首项是当前优先模型。</li>
+                <li>请求失败时会按 chain 顺序跳到下一个可用且 `enabled` 的模型。</li>
+                <li>切换成功后会自动回写 Claude 配置，后续请求默认使用新模型。</li>
+                <li>仅当模型“有额度限制且额度耗尽”才会被置为 `disabled`，其余模型保持 `enabled`。</li>
+                <li>额度刷新时间到达后 +1 分钟会自动刷新状态，系统重启时也会先拉取一次额度并重置状态。</li>
+              </ul>
+            </div>
             <div className="config-lines">
               {homeConfigLines.map((line) => (
                 <div className="config-line" key={line.key}>
@@ -779,7 +939,7 @@ function App() {
 
             {variableKeys.map((modelKey) => {
               const chain = fallbackChains[modelKey] ?? [];
-              const current = chain[0] || "未设置";
+              const current = fallbackCurrentByKey[modelKey] || chain[0] || "未设置";
               return (
                 <div className="home-row-block" key={modelKey}>
                   <div className="config-row">
@@ -801,10 +961,19 @@ function App() {
                   <div className="fallback-line">
                     <div className="config-key">Fallback Chain</div>
                     <div className="fallback-chip-list">
-                      {chain.length ? chain.map((modelId, index) => (
-                        <span className="fallback-chip" key={`${modelKey}:${modelId}`}>
+                      {chain.length ? chain.map((modelId) => (
+                        <span
+                          className={[
+                            "fallback-chip",
+                            modelMap.get(modelId)?.enabled === false ? "is-disabled" : "is-enabled",
+                            current === modelId ? "is-current" : "",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          key={`${modelKey}:${modelId}`}
+                        >
                           <span>{modelId}</span>
-                          {index === 0 ? <em>当前</em> : null}
+                          {current === modelId ? <em className="current-check" title="当前模型">✓</em> : null}
                           <button
                             disabled={submitting || chain.length <= 1}
                             onClick={() => {
@@ -911,6 +1080,9 @@ function App() {
                   </button>
                 </div>
               </div>
+              <div className="status-legend">
+                状态说明：主标签表示是否可用，副标签表示状态来源和原因（手动 / 自动、额度情况）。点击可切换启用状态。
+              </div>
               <p className="muted">最后同步时间: {formatTime(endpoint?.lastSyncAt)}</p>
               <div className="table-wrap">
                 <table>
@@ -936,14 +1108,41 @@ function App() {
                   </thead>
                   <tbody>
                     {displayedModels.map((model) => (
-                      <tr key={model.id}>
+                      <tr className={model.enabled ? "model-row-enabled" : "model-row-disabled"} key={model.id}>
+                        {(() => {
+                          const statusView = getModelStatusView(model);
+                          return (
+                            <>
                         <td>{model.modelId}</td>
                         <td>{model.displayName}</td>
                         <td>{model.provider || "-"}</td>
                         <td>{quotaFromModelMeta(model.meta)}</td>
                         <td>{quotaResetTimeFromModelMeta(model.meta)}</td>
                         <td>{modelScoreFromMeta(model.meta)}</td>
-                        <td>{model.enabled ? "enabled" : "disabled"}</td>
+                        <td>
+                          <button
+                            className={[
+                              "status-toggle-btn",
+                              `is-${statusView.tone}`,
+                              `source-${statusView.source}`,
+                            ].join(" ")}
+                            disabled={submitting}
+                            onClick={() => {
+                              void handleToggleModelEnabled(model);
+                            }}
+                            title={`${statusView.title}（${statusView.detail}），点击${model.enabled ? "禁用" : "启用"}模型`}
+                            type="button"
+                          >
+                            <span className="status-main">
+                              <span className="status-icon" aria-hidden="true">{statusView.tone === "enabled" ? "✓" : "×"}</span>
+                              <span>{statusView.title}</span>
+                            </span>
+                            <span className="status-sub">{statusView.detail}</span>
+                          </button>
+                        </td>
+                            </>
+                          );
+                        })()}
                       </tr>
                     ))}
                   </tbody>
@@ -1033,6 +1232,7 @@ function App() {
                     const rowClassName = [
                       selected ? "settings-row-selected settings-row-draggable" : "",
                       draggingModelId === modelId ? "settings-row-dragging" : "",
+                      model.enabled ? "" : "settings-row-disabled",
                     ]
                       .filter(Boolean)
                       .join(" ");

@@ -1,6 +1,8 @@
 import path from "node:path";
 import fs from "node:fs";
-import fastify from "fastify";
+import { Readable } from "node:stream";
+import type { ReadableStream as NodeReadableStream } from "node:stream/web";
+import fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import type {
@@ -8,6 +10,7 @@ import type {
   ApplyClaudeInput,
   EndpointRecord,
   EndpointView,
+  ModelRecord,
   ModelSource,
   SmartRoutingVariablePolicy,
 } from "@model-manager/shared";
@@ -21,6 +24,18 @@ import { EndpointPoller } from "./poller.js";
 
 const CLIPROXY_LOCAL_NAME = "CLIProxy Local";
 const CLIPROXY_FALLBACK_BASE_URL = "http://127.0.0.1:8317";
+const MODEL_MANAGER_PROXY_BASE_URL = `http://127.0.0.1:${DEFAULT_BACKEND_PORT}`;
+const FALLBACK_ERROR_TEXT_PATTERNS = [
+  /quota/,
+  /rate limit/,
+  /capacity/,
+  /temporarily unavailable/,
+  /overloaded/,
+  /exhaust/,
+  /not available/,
+  /model.*not found/,
+  /unsupported model/,
+];
 const CLAUDE_MODEL_KEYS = [
   "model",
   "ANTHROPIC_MODEL",
@@ -447,6 +462,13 @@ type FallbackChainView = {
   priorityList: string[];
 };
 
+type UpstreamAttemptResult = {
+  modelId: string;
+  status?: number;
+  error?: string;
+  bodySnippet?: string;
+};
+
 function normalizeModelIdList(modelIds: string[] | undefined, allowedModelIds: Set<string>): string[] {
   const dedup = new Set<string>();
   const normalized: string[] = [];
@@ -459,6 +481,455 @@ function normalizeModelIdList(modelIds: string[] | undefined, allowedModelIds: S
     normalized.push(trimmed);
   }
   return normalized;
+}
+
+type FallbackAttemptPlan = {
+  modelKey?: string;
+  modelIds: string[];
+};
+
+function buildFallbackCandidateKeys(
+  config: ReturnType<DataStore["getSmartRouting"]>,
+  preferredModelKeys?: string[],
+): string[] {
+  return Array.from(new Set([
+    ...(preferredModelKeys ?? []),
+    "model",
+    "ANTHROPIC_MODEL",
+    ...CLAUDE_MODEL_KEYS,
+    ...Object.keys(config.variables).sort((a, b) => a.localeCompare(b)),
+  ]));
+}
+
+function buildFallbackAttemptPlan(
+  requestedModelId: string,
+  config: ReturnType<DataStore["getSmartRouting"]>,
+  allowedModelIds: Set<string>,
+  preferredModelKeys?: string[],
+): FallbackAttemptPlan {
+  const requested = requestedModelId.trim();
+  if (!requested) {
+    return { modelIds: [] };
+  }
+  const candidateKeys = buildFallbackCandidateKeys(config, preferredModelKeys);
+
+  if (!allowedModelIds.has(requested)) {
+    for (const key of candidateKeys) {
+      const policy = config.variables[key];
+      if (!policy?.priorityList?.length) {
+        continue;
+      }
+      const list = normalizeModelIdList(policy.priorityList, allowedModelIds);
+      if (list.length) {
+        return {
+          modelKey: key,
+          modelIds: list,
+        };
+      }
+    }
+    return {
+      modelIds: [requested],
+    };
+  }
+
+  let matched: { key: string; list: string[] } | null = null;
+  for (const key of candidateKeys) {
+    const policy = config.variables[key];
+    if (!policy?.priorityList?.length) {
+      continue;
+    }
+    const list = normalizeModelIdList(policy.priorityList, allowedModelIds);
+    if (!list.length) {
+      continue;
+    }
+    const idx = list.indexOf(requested);
+    if (idx < 0) {
+      continue;
+    }
+    matched = { key, list };
+    break;
+  }
+
+  if (!matched?.list?.length) {
+    return {
+      modelIds: [requested],
+    };
+  }
+  const ordered = [requested, ...matched.list.filter((item) => item !== requested)];
+  return {
+    modelKey: matched.key,
+    modelIds: ordered,
+  };
+}
+
+function shouldTryNextModel(status: number, bodyText: string): boolean {
+  if (status === 401 || status === 407) {
+    return false;
+  }
+  if (status === 408 || status === 409 || status === 425 || status === 429) {
+    return true;
+  }
+  if (status >= 500) {
+    return true;
+  }
+  if (status === 400 || status === 403 || status === 404) {
+    const lower = bodyText.toLowerCase();
+    return FALLBACK_ERROR_TEXT_PATTERNS.some((pattern) => pattern.test(lower));
+  }
+  return false;
+}
+
+function applyUpstreamHeaders(
+  reply: FastifyReply,
+  response: Response,
+): void {
+  const hopByHop = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+  ]);
+  for (const [key, value] of response.headers.entries()) {
+    if (hopByHop.has(key.toLowerCase())) {
+      continue;
+    }
+    reply.header(key, value);
+  }
+}
+
+function buildForwardHeaders(
+  incomingHeaders: Record<string, unknown>,
+  apiKey: string,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const [rawKey, rawValue] of Object.entries(incomingHeaders)) {
+    const key = rawKey.toLowerCase();
+    if (key === "host" || key === "content-length" || key === "authorization" || key === "connection") {
+      continue;
+    }
+    if (Array.isArray(rawValue)) {
+      if (rawValue.length) {
+        headers[key] = rawValue.join(",");
+      }
+      continue;
+    }
+    if (typeof rawValue === "string") {
+      headers[key] = rawValue;
+      continue;
+    }
+    if (typeof rawValue === "number" || typeof rawValue === "boolean") {
+      headers[key] = String(rawValue);
+    }
+  }
+  headers.authorization = `Bearer ${apiKey}`;
+  if (!headers.accept) {
+    headers.accept = "application/json";
+  }
+  return headers;
+}
+
+async function proxyWithModelFallback(input: {
+  path: "/v1/messages" | "/v1/messages/count_tokens";
+  method: "POST";
+  request: FastifyRequest;
+  reply: FastifyReply;
+}): Promise<ApiResult<never> | void> {
+  const endpoint = store.listEndpoints()[0];
+  if (!endpoint) {
+    input.reply.code(404);
+    return fail("CLIProxy endpoint not found.");
+  }
+  const apiKey = decryptSecretWithDpapi(endpoint.apiKeyEncrypted);
+  if (!apiKey) {
+    input.reply.code(400);
+    return fail("CLIProxy endpoint API key is empty.");
+  }
+
+  const bodyObj = toObject(input.request.body);
+  const requestedModelId = asString(bodyObj.model).trim();
+  if (!requestedModelId) {
+    input.reply.code(400);
+    return fail("Request body.model is required.");
+  }
+
+  const allModels = store.listModels({ endpointId: endpoint.id });
+  const enabledModelIds = new Set(
+    allModels.filter((item) => item.enabled).map((item) => item.modelId),
+  );
+  const allowedModelIds = enabledModelIds.size
+    ? enabledModelIds
+    : new Set(allModels.map((item) => item.modelId));
+  const config = store.getSmartRouting();
+  const settingsPath = store.getSettings().claudeSettingsPath;
+  const requestedModelKeys: string[] = [];
+  const configuredModelValues: Record<string, string> = {};
+  try {
+    const current = await readClaudeSettings(settingsPath);
+    for (const [modelKey, modelId] of Object.entries(current.env.modelValues)) {
+      configuredModelValues[modelKey] = modelId;
+      if (modelId.trim() === requestedModelId) {
+        requestedModelKeys.push(modelKey);
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown settings read error";
+    console.warn(`[proxy] unable to read claude settings before fallback: ${message}`);
+  }
+
+  const attemptPlan = buildFallbackAttemptPlan(
+    requestedModelId,
+    config,
+    allowedModelIds,
+    requestedModelKeys,
+  );
+  const attemptModels = attemptPlan.modelIds;
+  if (!attemptModels.length) {
+    input.reply.code(400);
+    return fail("No available model for fallback.");
+  }
+  console.log(
+    `[proxy] ${input.path} requested=${requestedModelId} attempts=${attemptModels.join(" -> ")}`,
+  );
+
+  const attempts: UpstreamAttemptResult[] = [];
+  for (let index = 0; index < attemptModels.length; index += 1) {
+    const modelId = attemptModels[index];
+    const upstreamBody = {
+      ...bodyObj,
+      model: modelId,
+    };
+    try {
+      const response = await fetch(`${normalizeBaseUrl(endpoint.baseUrl)}${input.path}`, {
+        method: input.method,
+        headers: buildForwardHeaders(input.request.headers, apiKey),
+        body: JSON.stringify(upstreamBody),
+      });
+
+      if (response.ok) {
+        if (modelId !== requestedModelId) {
+          try {
+            await switchClaudeModelAfterFallback({
+              endpoint,
+              requestedModelId,
+              resolvedModelId: modelId,
+              enabledModelIds: allowedModelIds,
+              matchedModelKey: attemptPlan.modelKey,
+              requestedModelKeys,
+              configuredModelValues,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "unknown switch error";
+            console.warn(`[proxy] fallback switch apply failed: ${message}`);
+          }
+        }
+        console.log(
+          `[proxy] success model=${modelId} status=${response.status} fallbackCount=${index}`,
+        );
+        input.reply.code(response.status);
+        input.reply.header("x-mm-proxy-model", modelId);
+        input.reply.header("x-mm-proxy-fallback-count", String(index));
+        applyUpstreamHeaders(input.reply, response);
+
+        const contentType = response.headers.get("content-type") || "";
+        if (contentType.toLowerCase().includes("text/event-stream") && response.body) {
+          const stream = Readable.fromWeb(response.body as unknown as NodeReadableStream<Uint8Array>);
+          input.reply.send(stream);
+          return;
+        }
+        const bodyBytes = Buffer.from(await response.arrayBuffer());
+        input.reply.send(bodyBytes);
+        return;
+      }
+
+      const bodyText = await response.text();
+      attempts.push({
+        modelId,
+        status: response.status,
+        bodySnippet: bodyText.slice(0, 400),
+      });
+      const retryNext = shouldTryNextModel(response.status, bodyText);
+      console.warn(
+        `[proxy] upstream failed model=${modelId} status=${response.status} retryNext=${retryNext}`,
+      );
+
+      if (!retryNext || index === attemptModels.length - 1) {
+        input.reply.code(response.status);
+        input.reply.header("content-type", response.headers.get("content-type") || "application/json; charset=utf-8");
+        input.reply.send(bodyText);
+        return;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Network error";
+      attempts.push({
+        modelId,
+        error: message,
+      });
+      console.warn(`[proxy] request error model=${modelId} error=${message}`);
+      if (index === attemptModels.length - 1) {
+        input.reply.code(502);
+        return fail(`All fallback attempts failed: ${message}`);
+      }
+    }
+  }
+
+  input.reply.code(502);
+  return fail(`All fallback attempts failed. Attempts: ${JSON.stringify(attempts)}`);
+}
+
+async function switchClaudeModelAfterFallback(input: {
+  endpoint: EndpointRecord;
+  requestedModelId: string;
+  resolvedModelId: string;
+  enabledModelIds: Set<string>;
+  matchedModelKey?: string;
+  requestedModelKeys?: string[];
+  configuredModelValues?: Record<string, string>;
+}): Promise<void> {
+  const config = store.getSmartRouting();
+  const keys = Array.from(new Set([
+    ...(input.requestedModelKeys ?? []),
+    ...(input.matchedModelKey ? [input.matchedModelKey] : []),
+    ...Object.keys(config.variables),
+    ...Object.keys(input.configuredModelValues ?? {}),
+  ]));
+  if (!keys.length) {
+    return;
+  }
+  const apiKey = decryptSecretWithDpapi(input.endpoint.apiKeyEncrypted);
+  if (!apiKey) {
+    return;
+  }
+  const settingsPath = store.getSettings().claudeSettingsPath;
+  const nowIso = new Date().toISOString();
+
+  let changed = false;
+  for (const key of keys) {
+    const policy = config.variables[key];
+    if (!policy?.priorityList?.length) {
+      continue;
+    }
+    const enabledPriority = normalizeModelIdList(policy.priorityList, input.enabledModelIds);
+    if (!enabledPriority.length) {
+      continue;
+    }
+    const currentModelId = policy.currentModelId?.trim() || "";
+    const configuredModelId = asString(input.configuredModelValues?.[key]).trim();
+    const currentInvalid = Boolean(currentModelId) && !input.enabledModelIds.has(currentModelId);
+    const configuredInvalid = Boolean(configuredModelId) && !input.enabledModelIds.has(configuredModelId);
+    const shouldSwitch = (input.requestedModelKeys ?? []).includes(key)
+      || key === input.matchedModelKey
+      || currentModelId === input.requestedModelId
+      || configuredModelId === input.requestedModelId
+      || currentInvalid
+      || configuredInvalid;
+    if (!shouldSwitch) {
+      continue;
+    }
+
+    const nextModelId = enabledPriority.includes(input.resolvedModelId)
+      ? input.resolvedModelId
+      : enabledPriority[0];
+    const alreadyConfigured = configuredModelId === nextModelId;
+    const policyAlreadyCurrent = currentModelId === nextModelId;
+    if (!nextModelId || (policyAlreadyCurrent && alreadyConfigured)) {
+      continue;
+    }
+
+    await applyClaudeSettings({
+      settingsPath,
+      baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
+      apiKey,
+      modelId: nextModelId,
+      modelKey: key,
+    });
+
+    policy.currentModelId = nextModelId;
+    policy.lastSwitchAt = nowIso;
+    policy.lastReason = `proxy_fallback:${input.requestedModelId}->${nextModelId}`;
+    changed = true;
+    console.log(`[proxy] switched claude key=${key} model=${nextModelId}`);
+  }
+
+  if (changed) {
+    await store.setSmartRouting(config);
+  }
+}
+
+function buildEnabledSignature(models: ModelRecord[]): string {
+  return models
+    .map((item) => `${item.modelId}:${item.enabled ? "1" : "0"}`)
+    .sort((a, b) => a.localeCompare(b))
+    .join("|");
+}
+
+async function reconcileClaudeModelByStatus(input: {
+  endpoint: EndpointRecord;
+  reason: string;
+}): Promise<number> {
+  const models = store.listModels({ endpointId: input.endpoint.id });
+  const enabledModelIds = new Set(
+    models
+      .filter((item) => item.enabled)
+      .map((item) => item.modelId),
+  );
+  if (!enabledModelIds.size) {
+    return 0;
+  }
+
+  const config = store.getSmartRouting();
+  const keys = Object.keys(config.variables);
+  if (!keys.length) {
+    return 0;
+  }
+
+  const apiKey = decryptSecretWithDpapi(input.endpoint.apiKeyEncrypted);
+  if (!apiKey) {
+    return 0;
+  }
+
+  const settingsPath = store.getSettings().claudeSettingsPath;
+  const nowIso = new Date().toISOString();
+  let changedCount = 0;
+
+  for (const key of keys) {
+    const policy = config.variables[key];
+    if (!policy?.priorityList?.length) {
+      continue;
+    }
+    const enabledPriority = normalizeModelIdList(policy.priorityList, enabledModelIds);
+    if (!enabledPriority.length) {
+      continue;
+    }
+    const desiredModelId = enabledPriority[0];
+    const currentModelId = policy.currentModelId?.trim() || "";
+    if (!desiredModelId || currentModelId === desiredModelId) {
+      continue;
+    }
+
+    await applyClaudeSettings({
+      settingsPath,
+      baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
+      apiKey,
+      modelId: desiredModelId,
+      modelKey: key,
+    });
+
+    policy.currentModelId = desiredModelId;
+    policy.lastSwitchAt = nowIso;
+    policy.lastReason = `status_change:${input.reason}`;
+    changedCount += 1;
+    console.log(`[status-sync] switched key=${key} model=${desiredModelId} reason=${input.reason}`);
+  }
+
+  if (changedCount > 0) {
+    await store.setSmartRouting(config);
+  }
+  return changedCount;
 }
 
 async function ensureCliproxyOnlyEndpoint(store: DataStore): Promise<EndpointRecord> {
@@ -499,7 +970,28 @@ const store = new DataStore(STORAGE_PATH, defaultClaudePath);
 await store.init();
 await ensureCliproxyOnlyEndpoint(store);
 
-const poller = new EndpointPoller(store, decryptSecretWithDpapi);
+const endpointEnabledSignatures = new Map<string, string>();
+const poller = new EndpointPoller(
+  store,
+  decryptSecretWithDpapi,
+  async (input) => {
+    const endpoint = store.getEndpointById(input.endpointId);
+    if (!endpoint) {
+      return;
+    }
+    const nextSignature = buildEnabledSignature(input.models);
+    const previousSignature = endpointEnabledSignatures.get(input.endpointId);
+    endpointEnabledSignatures.set(input.endpointId, nextSignature);
+
+    if (input.reason !== "startup" && previousSignature === nextSignature) {
+      return;
+    }
+    await reconcileClaudeModelByStatus({
+      endpoint,
+      reason: `poller_${input.reason}`,
+    });
+  },
+);
 await poller.start();
 
 const app = fastify({
@@ -606,6 +1098,108 @@ app.get("/api/models", async (request) => {
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
   return ok(models);
+});
+
+app.put("/api/models/:id/enabled", async (request, reply) => {
+  try {
+    const params = request.params as { id?: string };
+    if (!isNonEmptyString(params.id)) {
+      reply.code(400);
+      return fail("model id is required.");
+    }
+
+    const body = (request.body ?? {}) as { enabled?: unknown };
+    if (typeof body.enabled !== "boolean") {
+      reply.code(400);
+      return fail("enabled(boolean) is required.");
+    }
+
+    const endpoint = store.listEndpoints()[0];
+    if (!endpoint) {
+      reply.code(404);
+      return fail("CLIProxy endpoint not found.");
+    }
+
+    const model = store.getModelById(params.id);
+    if (!model || model.endpointId !== endpoint.id) {
+      reply.code(404);
+      return fail("Model not found.");
+    }
+
+    const updated = await store.setModelEnabled(
+      model.id,
+      body.enabled,
+      model.source === "dynamic"
+        ? { statusOverride: body.enabled ? "enabled" : "disabled" }
+        : undefined,
+    );
+    await reconcileClaudeModelByStatus({
+      endpoint,
+      reason: `manual_toggle:${updated.modelId}:${updated.enabled ? "enabled" : "disabled"}`,
+    });
+    return ok(updated);
+  } catch (error) {
+    reply.code(400);
+    return fail(error instanceof Error ? error.message : "Failed to update model enabled status.");
+  }
+});
+
+app.get("/v1/models", async (request, reply) => {
+  try {
+    const endpoint = store.listEndpoints()[0];
+    if (!endpoint) {
+      reply.code(404);
+      return fail("CLIProxy endpoint not found.");
+    }
+    const apiKey = decryptSecretWithDpapi(endpoint.apiKeyEncrypted);
+    if (!apiKey) {
+      reply.code(400);
+      return fail("CLIProxy endpoint API key is empty.");
+    }
+
+    const rawUrl = request.raw.url || "/v1/models";
+    const queryIndex = rawUrl.indexOf("?");
+    const queryString = queryIndex >= 0 ? rawUrl.slice(queryIndex) : "";
+
+    const response = await fetch(`${normalizeBaseUrl(endpoint.baseUrl)}/v1/models${queryString}`, {
+      method: "GET",
+      headers: buildForwardHeaders(request.headers as Record<string, unknown>, apiKey),
+    });
+    const bodyBytes = Buffer.from(await response.arrayBuffer());
+
+    reply.code(response.status);
+    applyUpstreamHeaders(reply, response);
+    return reply.send(bodyBytes);
+  } catch (error) {
+    reply.code(502);
+    return fail(error instanceof Error ? error.message : "Failed to proxy /v1/models.");
+  }
+});
+
+app.post("/v1/messages", async (request, reply) => {
+  const result = await proxyWithModelFallback({
+    path: "/v1/messages",
+    method: "POST",
+    request,
+    reply,
+  });
+  if (result) {
+    return result;
+  }
+  return undefined;
+});
+
+app.post("/v1/messages/count_tokens", async (request, reply) => {
+  const result = await proxyWithModelFallback({
+    path: "/v1/messages/count_tokens",
+    method: "POST",
+    request,
+    reply,
+  });
+  if (result) {
+    return result;
+  }
+  return undefined;
 });
 
 app.post("/api/models/score", async (request, reply) => {
@@ -813,9 +1407,12 @@ app.get("/api/fallback-chains", async (request, reply) => {
         : configuredModelId
         ? [configuredModelId]
         : [];
+      const policyCurrent = isNonEmptyString(existing?.currentModelId) && availableModelIds.has(existing.currentModelId)
+        ? existing.currentModelId
+        : undefined;
       return {
         modelKey,
-        currentModelId: priorityList[0] ?? configuredModelId,
+        currentModelId: policyCurrent ?? configuredModelId ?? priorityList[0],
         priorityList,
       };
     });
@@ -862,7 +1459,7 @@ app.put("/api/fallback-chains/:modelKey", async (request, reply) => {
     const settingsPath = store.getSettings().claudeSettingsPath;
     await applyClaudeSettings({
       settingsPath,
-      baseUrl: endpoint.baseUrl,
+      baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
       apiKey,
       modelId: targetModelId,
       modelKey,
@@ -953,7 +1550,7 @@ app.post("/api/claude/apply", async (request, reply) => {
 
     const result = await applyClaudeSettings({
       settingsPath,
-      baseUrl: endpoint.baseUrl,
+      baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
       apiKey: secret,
       modelId: model.modelId,
       modelKey,
@@ -967,8 +1564,8 @@ app.post("/api/claude/apply", async (request, reply) => {
       modelId: model.modelId,
       modelSource: model.source,
       modelKey,
-      applyMode: "direct_anthropic",
-      resolvedBaseUrl: endpoint.baseUrl,
+      applyMode: "local_proxy",
+      resolvedBaseUrl: MODEL_MANAGER_PROXY_BASE_URL,
     });
   } catch (error) {
     reply.code(500);

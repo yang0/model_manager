@@ -72,6 +72,13 @@ export async function getModels(): Promise<ModelRecord[]> {
   return request<ModelRecord[]>("/api/models");
 }
 
+export async function updateModelEnabled(modelId: string, enabled: boolean): Promise<ModelRecord> {
+  return request<ModelRecord>(`/api/models/${encodeURIComponent(modelId)}/enabled`, {
+    method: "PUT",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 export async function scoreModels(payload?: { scoringModelId?: string }): Promise<{
   updatedCount: number;
   changedCount?: number;

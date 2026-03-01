@@ -1,112 +1,109 @@
 # model_manager Phase 1 Documentation (English)
 
-> Note (updated on 2026-03-01): the current codebase is now in a simplified mode that keeps only one endpoint (`CLIProxy Local`). This document records the original phase-1 delivery scope.
+Updated: 2026-03-01
 
-## 0. Incremental Update (2026-03-01, simplified mode)
+## 1. Phase Goal and Outcome
 
-- Added quota visibility in the CLIProxy model table:
-  - `Quota`: prefers `quota_display` / `quota_remaining_fraction`
-  - `Next update`: shows quota reset/recovery time (for example `quota_reset_at`)
-- OAuth quota data source:
-  - Reads CLIProxy management `auth-files`, then uses management `api-call` to query quota endpoints
-  - antigravity: `fetchAvailableModels`
-  - gemini-cli: `retrieveUserQuota`
-- Special handling:
-  - `iflow` provider is always displayed as unlimited
-  - Boolean quota flags (for example `quota_limited`) are filtered out in UI to avoid meaningless `true/false`
-- Management key source priority:
-  1. persisted management secret (`smartRouting.signals.management.secretKeyEncrypted`)
-  2. environment variable `CLIPROXY_MANAGEMENT_KEY`
+Phase 1 aimed to deliver a production-usable local model manager for Claude Code that can:
 
-## 1. Phase Goal
+- manage CLIProxy models in one place
+- configure per-variable fallback chains
+- switch models at runtime on request failures
+- write the switched model back into Claude settings automatically
 
-Phase 1 delivers a local model manager and Claude Code config tool with:
+This goal is completed.
 
-- Endpoint management (CLIProxy + manual endpoints)
-- Dynamic model sync plus manual model coexistence
-- Claude Code config visualization and auto-apply
-- Built-in OpenAI Responses -> Anthropic protocol conversion
-- Single-service runtime (same port for WebUI + API + gateway)
+## 2. Current Architecture
 
-## 2. Delivered Scope
+Recommended request path:
 
-### 2.1 Frontend (React + TypeScript + Vite)
+`Claude Code -> model_manager -> CLIProxy`
 
-- Split layout dashboard
-  - Left menu: `Home`, `CLIProxy Local`, dynamic endpoint list, add button
-  - Right area: home config, endpoint model list, endpoint config
-- Home page for Claude Code configuration
-  - Shows settings path, base URL, masked token, all model keys/values
-  - Cascading model selectors with auto-save behavior
-- Latest cascading rules
-  - Only `model` row can change endpoint
-  - Other rows follow the `model` endpoint
-  - If a same `modelId` exists in the new endpoint, keep that mapping
-  - Otherwise fallback to the `model` row model to avoid invalid config
-- CLIProxy Local page
-  - Config file display / import / refresh only
-  - No endpoint editing and no manual model creation on this page
+Notes:
 
-### 2.2 Backend (Node.js + TypeScript + Fastify)
+- model_manager runs as the local proxy at `http://127.0.0.1:3199`
+- Claude settings use model_manager as `ANTHROPIC_BASE_URL`
+- model_manager forwards to CLIProxy upstream
 
-- Business APIs (`/api/*`)
-  - endpoint CRUD, refresh, plaintext api key read
-  - model listing and manual model CRUD
-  - settings read/write
-  - Claude settings detect/apply
-- Dynamic model sync
-  - Polls `{baseUrl}/v1/models` by default
-  - Persists models and endpoint sync status
-- Secret handling
-  - Endpoint API keys are stored encrypted with Windows DPAPI
-- Built-in protocol gateway (`/v1/*`)
+## 3. Core Capabilities
+
+### 3.1 Model Sync and Quota Integration
+
+- Single endpoint mode: `CLIProxy Local`
+- Periodic model sync (default every 30s)
+- OAuth quota integration via CLIProxy management APIs:
+  - antigravity: per-model quota and reset time
+  - gemini-cli: quota aggregated from buckets to model level
+  - iflow: always treated as unlimited
+
+### 3.2 Runtime Fallback Switching
+
+- Request proxy endpoints: `/v1/messages`, `/v1/messages/count_tokens`
+- On failure, model_manager tries the next available model in the fallback chain
+- Response headers expose routing result:
+  - `x-mm-proxy-model`
+  - `x-mm-proxy-fallback-count`
+
+### 3.3 Automatic Claude Config Write-Back
+
+- Successful fallback switches are written back to Claude model variables
+- Model status changes (enable/disable) trigger model recalculation and config write-back
+- Updated keys include:
+  - `env.ANTHROPIC_BASE_URL` (fixed to local proxy)
+  - `env.ANTHROPIC_AUTH_TOKEN`
+  - `model`
+  - `ANTHROPIC_MODEL`
+  - `ANTHROPIC_DEFAULT_OPUS_MODEL`
+  - `ANTHROPIC_DEFAULT_SONNET_MODEL`
+  - `ANTHROPIC_DEFAULT_HAIKU_MODEL`
+  - `CLAUDE_CODE_SUBAGENT_MODEL`
+
+### 3.4 Model Status Management
+
+- Automatic behavior:
+  - only quota-limited models with exhausted quota are auto-disabled
+  - quota refresh is retried at `reset_time + 1 minute`
+  - on restart, quota is fetched and statuses are recalculated
+- Manual behavior:
+  - WebUI allows one-click enable/disable per model
+  - manual status changes also trigger fallback/config reconciliation
+
+## 4. Frontend Delivery
+
+- Stack: React + TypeScript + Vite
+- Pages:
+  - Home: Claude current config + fallback chains per variable
+  - CLIProxy Local: config import, refresh, model list, scoring, status operations
+- Status column in model list:
+  - clearly shows enabled/disabled and reason
+  - clickable to toggle state
+
+## 5. Backend Delivery
+
+- Stack: Node.js + TypeScript + Fastify
+- Main endpoints:
+  - `GET /api/health`
+  - `GET /api/endpoints`
+  - `POST /api/endpoints/import-cliproxy`
+  - `GET /api/endpoints/cliproxy-config`
+  - `POST /api/endpoints/:id/refresh`
+  - `GET /api/models`
+  - `PUT /api/models/:id/enabled`
+  - `POST /api/models/score`
+  - `GET /api/fallback-chains`
+  - `PUT /api/fallback-chains/:modelKey`
+  - `GET /api/settings`
+  - `PUT /api/settings`
+  - `GET /api/claude/detect-settings`
+  - `GET /api/claude/current`
+  - `POST /api/claude/apply`
+  - `GET /v1/models`
   - `POST /v1/messages`
   - `POST /v1/messages/count_tokens`
-  - `GET /v1/models`
-  - Converts OpenAI Responses upstream outputs into Anthropic-compatible outputs
-
-### 2.3 Single-Port Runtime
-
-In production mode, one backend port serves:
-
-- WebUI static files
-- `/api/*` management APIs
-- `/v1/*` gateway APIs
-
-Default port: `3199`
-
-## 3. Protocol and Model Support
-
-- Endpoint protocols:
-  - `anthropic`
-  - `openai_responses`
-- For `openai_responses` apply flow:
-  - `ANTHROPIC_BASE_URL` -> local gateway (default `http://127.0.0.1:3199`)
-  - `ANTHROPIC_AUTH_TOKEN` -> `mm_ep_<endpointId>`
-  - Gateway resolves endpoint by token and forwards to upstream Responses API
-
-## 4. Key Compatibility Fixes Completed
-
-- Fixed HTML response issue under `5173` dev mode for `/api` and `/v1`
-  - Added Vite dev proxy to backend
-- Fixed OpenAI-compatible upstream issues
-  - Stop forwarding `metadata` (causes 5xx on some gateways)
-  - Added upstream retry for transient network/socket failures
-- Fixed home auto-refresh overriding in-progress user selections
-  - Local selection is preserved until apply
-- Fixed UI-linking vs config-file mismatch
-  - Primary model change now applies linked model rows to Claude settings
-
-## 5. Repository Structure
-
-- `frontend/`: WebUI
-- `backend/`: local API service + built-in protocol gateway
-- `shared/`: shared types
-- `docs/`: phase documentation
 
 ## 6. Run Instructions
 
-### Development mode
+### Development
 
 ```bash
 npm install
@@ -125,10 +122,7 @@ npm run start -w backend
 
 - Unified entry: `http://127.0.0.1:3199`
 
-## 7. Phase Limits and Next Suggestions
+## 7. Known Boundary
 
-- Current implementation prioritizes common Claude Code request flows
-- Phase 2 suggestions:
-  - endpoint-level advanced retry policy
-  - model capability tags (tool use / vision / long context)
-  - richer templates for Claude model-key strategy
+- fallback continuation depends on upstream status codes and error text patterns
+- for non-standard upstream error formats, inspect logs and extend fallback detection rules if needed

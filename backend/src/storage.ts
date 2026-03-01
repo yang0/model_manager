@@ -34,6 +34,7 @@ interface DynamicModelInput {
   modelId: string;
   displayName: string;
   provider?: string;
+  enabled?: boolean;
   meta?: Record<string, unknown>;
 }
 
@@ -51,6 +52,7 @@ const PERSISTED_DYNAMIC_META_KEYS = [
   "scored_at",
   "quota_limited",
   "quota_reason",
+  "status_override",
 ] as const;
 
 function pickPersistedDynamicMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> {
@@ -598,7 +600,7 @@ export class DataStore {
         displayName: item.displayName || item.modelId,
         provider: item.provider,
         source: "dynamic" as const,
-        enabled: existed?.enabled ?? true,
+        enabled: typeof item.enabled === "boolean" ? item.enabled : (existed?.enabled ?? true),
         createdAt: existed?.createdAt ?? now,
         updatedAt: now,
         meta: {
@@ -675,6 +677,38 @@ export class DataStore {
       displayName: typeof input.displayName === "string" ? input.displayName.trim() : current.displayName,
       provider: typeof input.provider === "string" ? input.provider.trim() || undefined : current.provider,
       enabled: typeof input.enabled === "boolean" ? input.enabled : current.enabled,
+      updatedAt: toIsoNow(),
+    };
+    this.state.models[index] = updated;
+    await this.persist();
+    return { ...updated };
+  }
+
+  async setModelEnabled(
+    modelId: string,
+    enabled: boolean,
+    input?: {
+      statusOverride?: "enabled" | "disabled" | null;
+    },
+  ): Promise<ModelRecord> {
+    const index = this.state.models.findIndex((item) => item.id === modelId);
+    if (index < 0) {
+      throw new Error("Model not found");
+    }
+    const current = this.state.models[index];
+    const nextMeta: Record<string, unknown> = { ...(current.meta ?? {}) };
+    if (current.source === "dynamic") {
+      if (input?.statusOverride === "enabled" || input?.statusOverride === "disabled") {
+        nextMeta.status_override = input.statusOverride;
+      } else if (Object.prototype.hasOwnProperty.call(nextMeta, "status_override")) {
+        delete nextMeta.status_override;
+      }
+    }
+
+    const updated: ModelRecord = {
+      ...current,
+      enabled,
+      meta: nextMeta,
       updatedAt: toIsoNow(),
     };
     this.state.models[index] = updated;
