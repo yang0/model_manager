@@ -1,5 +1,5 @@
 import type { EndpointRecord } from "@model-manager/shared";
-import { fetchCliproxyModels } from "./cliproxy.js";
+import { fetchCliproxyModels, fetchCliproxyQuotaSnapshot } from "./cliproxy.js";
 import type { DataStore } from "./storage.js";
 
 type RefreshReason = "startup" | "poll" | "manual";
@@ -70,13 +70,60 @@ export class EndpointPoller {
         apiKey,
       });
 
+      let quotaSnapshot: Awaited<ReturnType<typeof fetchCliproxyQuotaSnapshot>> | null = null;
+      const smartRouting = this.store.getSmartRouting();
+      const encryptedManagementSecret = smartRouting.signals.management.secretKeyEncrypted;
+      const managementSecret = (encryptedManagementSecret
+        ? this.decryptSecret(encryptedManagementSecret)
+        : "") || process.env.CLIPROXY_MANAGEMENT_KEY || "";
+      if (managementSecret) {
+        try {
+          quotaSnapshot = await fetchCliproxyQuotaSnapshot({
+            baseUrl: endpoint.baseUrl,
+            managementKey: managementSecret,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown management quota error";
+          console.warn(`[poller] quota snapshot skipped: ${message}`);
+        }
+      }
+
       await this.store.replaceDynamicModels(
         endpoint.id,
         upstreamModels.map((model) => ({
           modelId: model.modelId,
           displayName: model.displayName,
           provider: model.provider,
-          meta: model.raw,
+          meta: (() => {
+            const meta: Record<string, unknown> = { ...model.raw };
+            const modelQuota = quotaSnapshot?.byModelId?.[model.modelId];
+            const providerKey = (model.provider || "").trim().toLowerCase();
+            const providerQuota = providerKey ? quotaSnapshot?.byProvider?.[providerKey] : undefined;
+            const quota = modelQuota ?? providerQuota;
+
+            if (quota?.quotaDisplay) {
+              meta.quota_display = quota.quotaDisplay;
+            }
+            if (typeof quota?.remainingFraction === "number") {
+              meta.quota_remaining_fraction = quota.remainingFraction;
+            }
+            if (quota?.resetAt) {
+              meta.quota_reset_at = quota.resetAt;
+            }
+            if (quota?.source) {
+              meta.quota_source = quota.source;
+            }
+            if (quota?.unlimited) {
+              meta.quota_unlimited = true;
+            }
+
+            if (/iflow/i.test(providerKey)) {
+              meta.quota_unlimited = true;
+              meta.quota_display = "不限量";
+            }
+
+            return meta;
+          })(),
         })),
       );
       await this.store.setEndpointSyncStatus(endpoint.id, "ok");

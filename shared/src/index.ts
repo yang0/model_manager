@@ -1,5 +1,11 @@
 export type ModelSource = "dynamic" | "manual";
 export type EndpointProtocol = "anthropic" | "openai_responses";
+export type SmartRoutingGenerationMode = "startup_and_model_change" | "initial_only" | "always_before_switch";
+export type SmartRoutingSignalMode = "management" | "inference" | "hybrid";
+export type SmartRoutingHealthState = "healthy" | "degraded" | "unknown";
+export type SmartRoutingHealthSource = "management" | "inference" | "mixed" | "none";
+export type SmartRoutingGenerationSource = "ai" | "heuristic";
+export type SmartRoutingGenerationProcessStatus = "idle" | "running" | "succeeded" | "failed";
 
 export interface EndpointRecord {
   id: string;
@@ -36,11 +42,80 @@ export interface AppSettings {
   defaultPollingIntervalSec: number;
 }
 
+export interface SmartRoutingGenerationConfig {
+  mode: SmartRoutingGenerationMode;
+  generatorModelId?: string;
+  systemPromptTemplate?: string;
+  userPromptTemplate?: string;
+}
+
+export interface SmartRoutingManagementSignalConfig {
+  baseUrl: string;
+  pollSec: number;
+  secretKeyEncrypted?: string;
+}
+
+export interface SmartRoutingInferenceSignalConfig {
+  windowMin: number;
+  quotaErrorThreshold: number;
+}
+
+export interface SmartRoutingSignalsConfig {
+  mode: SmartRoutingSignalMode;
+  management: SmartRoutingManagementSignalConfig;
+  inference: SmartRoutingInferenceSignalConfig;
+}
+
+export interface SmartRoutingVariablePolicy {
+  modelKey: string;
+  priorityList: string[];
+  currentModelId?: string;
+  lastSwitchAt?: string;
+  lastReason?: string;
+  lockTop?: boolean;
+}
+
+export interface SmartRoutingModelHealth {
+  state: SmartRoutingHealthState;
+  source: SmartRoutingHealthSource;
+  reason?: string;
+  updatedAt: string;
+}
+
+export interface SmartRoutingRuntimeState {
+  healthByModelId: Record<string, SmartRoutingModelHealth>;
+  lastGenerationAt?: string;
+  lastGenerationSource?: SmartRoutingGenerationSource;
+  lastGenerationChangedKeys?: number;
+  lastGenerationMessage?: string;
+  generationProcess?: {
+    status: SmartRoutingGenerationProcessStatus;
+    stage?: string;
+    startedAt?: string;
+    updatedAt?: string;
+    finishedAt?: string;
+    logs: string[];
+  };
+  lastEvaluationAt?: string;
+  lastModelSignature?: string;
+  lastError?: string;
+}
+
+export interface SmartRoutingConfig {
+  enabled: boolean;
+  autoApplyToClaude: boolean;
+  generation: SmartRoutingGenerationConfig;
+  signals: SmartRoutingSignalsConfig;
+  variables: Record<string, SmartRoutingVariablePolicy>;
+  runtime: SmartRoutingRuntimeState;
+}
+
 export interface StorageState {
-  version: 1;
+  version: 2;
   endpoints: EndpointRecord[];
   models: ModelRecord[];
   settings: AppSettings;
+  smartRouting: SmartRoutingConfig;
 }
 
 export interface EndpointView {
@@ -99,4 +174,39 @@ export interface ApiResult<T> {
   ok: boolean;
   data?: T;
   error?: string;
+}
+
+export interface SmartRoutingView {
+  enabled: boolean;
+  autoApplyToClaude: boolean;
+  generation: SmartRoutingGenerationConfig;
+  signals: {
+    mode: SmartRoutingSignalMode;
+    management: {
+      baseUrl: string;
+      pollSec: number;
+      hasSecretKey: boolean;
+      secretKey?: string;
+    };
+    inference: SmartRoutingInferenceSignalConfig;
+  };
+  variables: Record<string, SmartRoutingVariablePolicy>;
+  runtime: SmartRoutingRuntimeState;
+}
+
+export interface UpdateSmartRoutingInput {
+  enabled?: boolean;
+  autoApplyToClaude?: boolean;
+  generation?: Partial<SmartRoutingGenerationConfig>;
+  signals?: {
+    mode?: SmartRoutingSignalMode;
+    management?: {
+      baseUrl?: string;
+      pollSec?: number;
+      secretKey?: string;
+      clearSecretKey?: boolean;
+    };
+    inference?: Partial<SmartRoutingInferenceSignalConfig>;
+  };
+  variables?: Record<string, SmartRoutingVariablePolicy>;
 }

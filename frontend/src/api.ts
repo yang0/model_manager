@@ -1,83 +1,48 @@
-import type { ApiResult, AppSettings, ClaudeCurrentState, EndpointProtocol, EndpointView, ModelRecord } from "./types";
+import type {
+  ApiResult,
+  AppSettings,
+  ClaudeCurrentState,
+  EndpointView,
+  FallbackChainView,
+  ModelRecord,
+} from "./types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  const headers = new Headers(options?.headers ?? {});
+  if (options?.body !== undefined && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
   const response = await fetch(`${API_BASE}${url}`, {
     ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(options?.headers ?? {}),
-    },
+    headers,
   });
 
-  const payload = (await response.json()) as ApiResult<T>;
-  if (!response.ok || !payload.ok || payload.data === undefined) {
-    throw new Error(payload.error || `Request failed with status ${response.status}`);
+  const raw = await response.text();
+  let payload: ApiResult<T> | null = null;
+  try {
+    payload = raw ? (JSON.parse(raw) as ApiResult<T>) : null;
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok || !payload?.ok || payload.data === undefined) {
+    const fallback = raw ? `${response.status} ${response.statusText}: ${raw}` : `Request failed with status ${response.status}`;
+    throw new Error(payload?.error || fallback);
   }
   return payload.data;
-}
-
-export interface CreateEndpointPayload {
-  name: string;
-  baseUrl: string;
-  apiKey: string;
-  protocol?: EndpointProtocol;
-  enabled?: boolean;
-  dynamicEnabled?: boolean;
-  pollingIntervalSec?: number;
-}
-
-export interface UpdateEndpointPayload {
-  name?: string;
-  baseUrl?: string;
-  apiKey?: string;
-  protocol?: EndpointProtocol;
-  enabled?: boolean;
-  dynamicEnabled?: boolean;
-  pollingIntervalSec?: number;
-}
-
-export interface CreateManualModelPayload {
-  endpointId: string;
-  modelId: string;
-  displayName?: string;
-  provider?: string;
 }
 
 export async function getEndpoints(): Promise<EndpointView[]> {
   return request<EndpointView[]>("/api/endpoints");
 }
 
-export async function createEndpoint(payload: CreateEndpointPayload): Promise<EndpointView> {
-  return request<EndpointView>("/api/endpoints", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function updateEndpoint(id: string, payload: UpdateEndpointPayload): Promise<EndpointView> {
-  return request<EndpointView>(`/api/endpoints/${id}`, {
-    method: "PUT",
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function deleteEndpoint(id: string): Promise<void> {
-  await request<{ deleted: boolean }>(`/api/endpoints/${id}`, {
-    method: "DELETE",
-  });
-}
-
 export async function refreshEndpoint(id: string): Promise<EndpointView> {
   return request<EndpointView>(`/api/endpoints/${id}/refresh`, {
     method: "POST",
   });
-}
-
-export async function getEndpointApiKey(id: string): Promise<string> {
-  const result = await request<{ apiKey: string }>(`/api/endpoints/${id}/api-key`);
-  return result.apiKey;
 }
 
 export async function importCliproxyConfig(payload?: {
@@ -103,21 +68,22 @@ export async function getCliproxyConfigInfo(): Promise<{
   return request("/api/endpoints/cliproxy-config");
 }
 
-export async function getModels(endpointId?: string): Promise<ModelRecord[]> {
-  const query = endpointId ? `?endpointId=${encodeURIComponent(endpointId)}` : "";
-  return request<ModelRecord[]>(`/api/models${query}`);
+export async function getModels(): Promise<ModelRecord[]> {
+  return request<ModelRecord[]>("/api/models");
 }
 
-export async function createManualModel(payload: CreateManualModelPayload): Promise<ModelRecord> {
-  return request<ModelRecord>("/api/models/manual", {
+export async function scoreModels(payload?: { scoringModelId?: string }): Promise<{
+  updatedCount: number;
+  changedCount?: number;
+  source?: string;
+  scoringModelId: string;
+  models: ModelRecord[];
+}> {
+  return request("/api/models/score", {
     method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function deleteManualModel(modelId: string): Promise<void> {
-  await request<{ deleted: boolean }>(`/api/models/manual/${modelId}`, {
-    method: "DELETE",
+    body: JSON.stringify({
+      scoringModelId: payload?.scoringModelId ?? "",
+    }),
   });
 }
 
@@ -130,10 +96,6 @@ export async function updateSettings(payload: Partial<AppSettings>): Promise<App
     method: "PUT",
     body: JSON.stringify(payload),
   });
-}
-
-export async function detectClaudeSettings(): Promise<{ detectedPath: string; configuredPath: string }> {
-  return request<{ detectedPath: string; configuredPath: string }>("/api/claude/detect-settings");
 }
 
 export async function getClaudeCurrent(): Promise<ClaudeCurrentState> {
@@ -155,11 +117,22 @@ export async function applyClaudeConfig(payload: {
   modelId: string;
   modelSource: string;
   modelKey: string;
-  applyMode?: "direct_anthropic" | "via_local_gateway";
+  applyMode?: "direct_anthropic";
   resolvedBaseUrl?: string;
 }> {
   return request("/api/claude/apply", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export async function getFallbackChains(): Promise<FallbackChainView[]> {
+  return request<FallbackChainView[]>("/api/fallback-chains");
+}
+
+export async function updateFallbackChain(modelKey: string, priorityList: string[]): Promise<FallbackChainView> {
+  return request<FallbackChainView>(`/api/fallback-chains/${encodeURIComponent(modelKey)}`, {
+    method: "PUT",
+    body: JSON.stringify({ priorityList }),
   });
 }

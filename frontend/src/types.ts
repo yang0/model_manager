@@ -1,5 +1,11 @@
 export type ModelSource = "dynamic" | "manual";
 export type EndpointProtocol = "anthropic" | "openai_responses";
+export type SmartRoutingGenerationMode = "startup_and_model_change" | "initial_only" | "always_before_switch";
+export type SmartRoutingSignalMode = "management" | "inference" | "hybrid";
+export type SmartRoutingHealthState = "healthy" | "degraded" | "unknown";
+export type SmartRoutingHealthSource = "management" | "inference" | "mixed" | "none";
+export type SmartRoutingGenerationSource = "ai" | "heuristic";
+export type SmartRoutingGenerationProcessStatus = "idle" | "running" | "succeeded" | "failed";
 
 export interface EndpointView {
   id: string;
@@ -28,6 +34,7 @@ export interface ModelRecord {
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
+  meta?: Record<string, unknown>;
 }
 
 export interface AppSettings {
@@ -52,4 +59,96 @@ export interface ClaudeCurrentState {
     modelValues: Record<string, string>;
     modelKeys: string[];
   };
+}
+
+export interface FallbackChainView {
+  modelKey: string;
+  currentModelId?: string;
+  priorityList: string[];
+}
+
+export interface SmartRoutingVariablePolicy {
+  modelKey: string;
+  priorityList: string[];
+  currentModelId?: string;
+  lastSwitchAt?: string;
+  lastReason?: string;
+  lockTop?: boolean;
+}
+
+export interface SmartRoutingModelHealth {
+  state: SmartRoutingHealthState;
+  source: SmartRoutingHealthSource;
+  reason?: string;
+  updatedAt: string;
+}
+
+export interface SmartRoutingRuntimeState {
+  healthByModelId: Record<string, SmartRoutingModelHealth>;
+  lastGenerationAt?: string;
+  lastGenerationSource?: SmartRoutingGenerationSource;
+  lastGenerationChangedKeys?: number;
+  lastGenerationMessage?: string;
+  generationProcess?: {
+    status: SmartRoutingGenerationProcessStatus;
+    stage?: string;
+    startedAt?: string;
+    updatedAt?: string;
+    finishedAt?: string;
+    logs: string[];
+  };
+  lastEvaluationAt?: string;
+  lastModelSignature?: string;
+  lastError?: string;
+}
+
+export interface SmartRoutingView {
+  enabled: boolean;
+  autoApplyToClaude: boolean;
+  generation: {
+    mode: SmartRoutingGenerationMode;
+    generatorModelId?: string;
+    systemPromptTemplate?: string;
+    userPromptTemplate?: string;
+  };
+  signals: {
+    mode: SmartRoutingSignalMode;
+    management: {
+      baseUrl: string;
+      pollSec: number;
+      hasSecretKey: boolean;
+      secretKey?: string;
+    };
+    inference: {
+      windowMin: number;
+      quotaErrorThreshold: number;
+    };
+  };
+  variables: Record<string, SmartRoutingVariablePolicy>;
+  runtime: SmartRoutingRuntimeState;
+}
+
+export interface UpdateSmartRoutingInput {
+  enabled?: boolean;
+  autoApplyToClaude?: boolean;
+  generation?: {
+    mode?: SmartRoutingGenerationMode;
+    generatorModelId?: string;
+    systemPromptTemplate?: string;
+    userPromptTemplate?: string;
+  };
+  signals?: {
+    mode?: SmartRoutingSignalMode;
+    management?: {
+      baseUrl?: string;
+      pollSec?: number;
+      secretKey?: string;
+      clearSecretKey?: boolean;
+    };
+    inference?: {
+      windowMin?: number;
+      quotaErrorThreshold?: number;
+    };
+  };
+  variables?: Record<string, SmartRoutingVariablePolicy>;
 }

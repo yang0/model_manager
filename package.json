@@ -8,13 +8,14 @@
     "shared"
   ],
   "scripts": {
-    "dev": "concurrently -k \"npm:dev -w backend\" \"npm:dev -w frontend\"",
+    "dev": "concurrently -k \"npm:dev -w backend\" \"npx wait-on tcp:127.0.0.1:3199 && npm run dev -w frontend -- --host 127.0.0.1 --port 5173 --strictPort\"",
     "build": "npm run build -w shared && npm run build -w backend && npm run build -w frontend",
     "start": "npm run start -w backend",
     "lint": "npm run lint -ws --if-present",
     "test": "npm run test -ws --if-present"
   },
   "devDependencies": {
-    "concurrently": "^9.2.1"
+    "concurrently": "^9.2.1",
+    "wait-on": "^9.0.4"
   }
 }

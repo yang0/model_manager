@@ -1,42 +1,199 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ChangeEvent, FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ChangeEvent, DragEvent } from "react";
 import "./App.css";
 import {
-  applyClaudeConfig,
-  createEndpoint,
-  createManualModel,
-  deleteManualModel,
   getClaudeCurrent,
   getCliproxyConfigInfo,
-  getEndpointApiKey,
   getEndpoints,
+  getFallbackChains,
   getModels,
   importCliproxyConfig,
   refreshEndpoint,
-  updateEndpoint,
+  scoreModels,
+  updateFallbackChain,
 } from "./api";
-import type { ClaudeCurrentState, EndpointProtocol, EndpointView, ModelRecord } from "./types";
+import type {
+  ClaudeCurrentState,
+  EndpointView,
+  FallbackChainView,
+  ModelRecord,
+} from "./types";
 
 type MessageState = {
   type: "success" | "error";
   text: string;
 } | null;
 
-type MenuKey = "home" | `endpoint:${string}`;
-type HomeModelRow = {
-  modelKey: string;
-  endpointId: string;
-  modelRecordId: string;
-};
-const CURRENT_CONFIG_ENDPOINT_ID = "__current_config_endpoint__";
-const CLIPROXY_LOCAL_NAME = "CLIProxy Local";
+type MenuKey = "home" | "cliproxy";
 
-const defaultEndpointForm = {
-  name: "",
-  baseUrl: "http://127.0.0.1:8317",
-  apiKey: "",
-  protocol: "anthropic" as EndpointProtocol,
-};
+const CLIPROXY_LOCAL_NAME = "CLIProxy Local";
+const DEFAULT_MODEL_KEYS = [
+  "model",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+const QUOTA_PRIMARY_KEYS = [
+  "quota_display",
+  "quota_text",
+  "quota",
+  "remaining_quota",
+  "available_quota",
+  "quota_remaining",
+  "credit",
+  "credits",
+  "balance",
+  "remaining",
+  "remain",
+  "limit",
+  "token_limit",
+  "daily_limit",
+  "monthly_limit",
+];
+const QUOTA_KEYWORDS = ["quota", "credit", "balance", "remaining", "remain", "limit", "available", "left"];
+const QUOTA_RESET_KEYS = [
+  "quota_reset_at",
+  "next_quota_update_at",
+  "next_refresh_at",
+  "reset_time",
+  "resetTime",
+  "reset_at",
+  "resetAt",
+];
+const DRAFT_CHAIN_DRAG_TYPE = "application/x-model-manager-draft-model-id";
+
+function toQuotaText(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text ? text : null;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((item) => toQuotaText(item))
+      .filter((item): item is string => Boolean(item));
+    return parts.length ? parts.join(", ") : null;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => {
+        const text = toQuotaText(item);
+        return text ? `${key}:${text}` : null;
+      })
+      .filter((item): item is string => Boolean(item));
+    return entries.length ? entries.join(" | ") : null;
+  }
+  return null;
+}
+
+function quotaFromModelMeta(meta?: Record<string, unknown>): string {
+  if (!meta) {
+    return "-";
+  }
+
+  if (meta.quota_unlimited === true) {
+    return "不限量";
+  }
+
+  if (typeof meta.quota_remaining_fraction === "number" && Number.isFinite(meta.quota_remaining_fraction)) {
+    const fraction = Math.max(0, Math.min(1, meta.quota_remaining_fraction));
+    const percent = fraction * 100;
+    if (percent >= 99.95) {
+      return "100%";
+    }
+    return percent >= 10 ? `${percent.toFixed(0)}%` : `${percent.toFixed(1)}%`;
+  }
+
+  for (const key of QUOTA_PRIMARY_KEYS) {
+    const value = meta[key];
+    if (typeof value === "boolean") {
+      continue;
+    }
+    const text = toQuotaText(value);
+    if (text) {
+      return text;
+    }
+  }
+
+  for (const [key, value] of Object.entries(meta)) {
+    const lowered = key.toLowerCase();
+    if (!QUOTA_KEYWORDS.some((token) => lowered.includes(token))) {
+      continue;
+    }
+    if (typeof value === "boolean") {
+      continue;
+    }
+    if (/(quota_limited|quota_reason|limit_reached|limited|enabled)$/.test(lowered)) {
+      continue;
+    }
+    const text = toQuotaText(value);
+    if (text) {
+      return text;
+    }
+  }
+
+  return "-";
+}
+
+function quotaResetTimeFromModelMeta(meta?: Record<string, unknown>): string {
+  if (!meta) {
+    return "-";
+  }
+  for (const key of QUOTA_RESET_KEYS) {
+    const value = meta[key];
+    if (typeof value !== "string" || !value.trim()) {
+      continue;
+    }
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      continue;
+    }
+    return date.toLocaleString(undefined, {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+  }
+  return "-";
+}
+
+function modelScoreValueFromMeta(meta?: Record<string, unknown>): number | null {
+  if (!meta) {
+    return null;
+  }
+  const candidates = [
+    meta.performance_score,
+    meta.performanceScore,
+    meta.score,
+    meta.model_score,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return Math.round(value);
+    }
+    if (typeof value === "string" && value.trim()) {
+      const asNum = Number(value);
+      if (Number.isFinite(asNum)) {
+        return Math.round(asNum);
+      }
+    }
+  }
+  return null;
+}
+
+function modelScoreFromMeta(meta?: Record<string, unknown>): string {
+  const value = modelScoreValueFromMeta(meta);
+  return value === null ? "-" : String(value);
+}
 
 function formatTime(value?: string): string {
   if (!value) {
@@ -45,42 +202,23 @@ function formatTime(value?: string): string {
   return new Date(value).toLocaleString();
 }
 
-function menuToEndpointId(menu: MenuKey): string | null {
-  return menu.startsWith("endpoint:") ? menu.slice("endpoint:".length) : null;
+function resolveCliproxyEndpoint(endpoints: EndpointView[]): EndpointView | null {
+  return endpoints.find((item) => item.name.trim().toLowerCase() === CLIPROXY_LOCAL_NAME.toLowerCase())
+    ?? endpoints[0]
+    ?? null;
 }
 
-function isCliproxyLocalEndpoint(endpoint?: Pick<EndpointView, "name"> | null): boolean {
-  return endpoint?.name?.trim().toLowerCase() === CLIPROXY_LOCAL_NAME.toLowerCase();
+function chainMapFromRows(rows: FallbackChainView[]): Record<string, string[]> {
+  return Object.fromEntries(rows.map((row) => [row.modelKey, row.priorityList]));
 }
 
-function isOpenAiResponsesEndpoint(endpoint?: Pick<EndpointView, "protocol"> | null): boolean {
-  return endpoint?.protocol === "openai_responses";
-}
-
-function normalizeClaudeBaseUrl(baseUrl?: string): string {
-  const input = (baseUrl ?? "").trim();
-  if (!input) {
-    return "";
-  }
-  return input.replace(/\/+$/, "");
-}
-
-function inferCurrentEndpointName(baseUrl?: string): string {
-  if (!baseUrl) {
-    return "当前配置 Endpoint";
-  }
-  try {
-    const host = new URL(baseUrl).hostname.toLowerCase();
-    if (host.includes("kimi")) {
-      return "Kimi (当前配置)";
-    }
-    return `当前配置 (${host})`;
-  } catch {
-    if (baseUrl.includes("kimi")) {
-      return "Kimi (当前配置)";
-    }
-    return "当前配置 Endpoint";
-  }
+function normalizeVariableKeys(current: ClaudeCurrentState | null, fallbackMap: Record<string, string[]>): string[] {
+  const base = current?.env.modelKeys?.length
+    ? current.env.modelKeys
+    : DEFAULT_MODEL_KEYS;
+  const set = new Set<string>([...base, ...Object.keys(fallbackMap)]);
+  const extras = Array.from(set).filter((key) => !base.includes(key)).sort((a, b) => a.localeCompare(b));
+  return [...base, ...extras];
 }
 
 function App() {
@@ -89,229 +227,151 @@ function App() {
   const [message, setMessage] = useState<MessageState>(null);
   const [activeMenu, setActiveMenu] = useState<MenuKey>("home");
 
-  const [endpoints, setEndpoints] = useState<EndpointView[]>([]);
+  const [endpoint, setEndpoint] = useState<EndpointView | null>(null);
   const [models, setModels] = useState<ModelRecord[]>([]);
   const [claudeCurrent, setClaudeCurrent] = useState<ClaudeCurrentState | null>(null);
+  const [fallbackChains, setFallbackChains] = useState<Record<string, string[]>>({});
 
-  const [homeModelRows, setHomeModelRows] = useState<HomeModelRow[]>([]);
-  const [homeRowsDirty, setHomeRowsDirty] = useState(false);
-  const [showAddEndpointModal, setShowAddEndpointModal] = useState(false);
-  const [newEndpoint, setNewEndpoint] = useState(defaultEndpointForm);
-  const [manualModelForm, setManualModelForm] = useState({
-    modelId: "",
-    displayName: "",
-    provider: "",
-  });
-  const [endpointConfigForm, setEndpointConfigForm] = useState({
-    baseUrl: "",
-    apiKey: "",
-    protocol: "anthropic" as EndpointProtocol,
-  });
   const [cliproxyConfigInfo, setCliproxyConfigInfo] = useState({
     found: false,
     configPath: "",
     baseUrl: "",
   });
+  const [scoringModelIdInput, setScoringModelIdInput] = useState("");
   const [selectedCliproxyConfigName, setSelectedCliproxyConfigName] = useState("");
   const [selectedCliproxyConfigContent, setSelectedCliproxyConfigContent] = useState("");
+  const [isScoringModels, setIsScoringModels] = useState(false);
+  const [scoreSortOrder, setScoreSortOrder] = useState<"none" | "desc" | "asc">("none");
+
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsModelKey, setSettingsModelKey] = useState("");
+  const [draftChain, setDraftChain] = useState<string[]>([]);
+  const [draggingModelId, setDraggingModelId] = useState<string | null>(null);
+  const selectAllDraftRef = useRef<HTMLInputElement | null>(null);
+  const [settingsSort, setSettingsSort] = useState<{
+    field: "score" | "provider" | "name";
+    direction: "asc" | "desc";
+  }>({
+    field: "score",
+    direction: "desc",
+  });
 
   const setSuccess = (text: string) => setMessage({ type: "success", text });
   const setError = (error: unknown) =>
     setMessage({ type: "error", text: error instanceof Error ? error.message : "Unexpected error." });
 
-  const applyRowsToClaude = useCallback(async (rows: HomeModelRow[]): Promise<number> => {
-    let applied = 0;
-    for (const row of rows) {
-      if (!row.modelRecordId) {
-        continue;
-      }
-      const model = models.find((item) => item.id === row.modelRecordId);
-      if (!model) {
-        continue;
-      }
-      await applyClaudeConfig({
-        endpointId: model.endpointId,
-        modelRecordId: model.id,
-        modelKey: row.modelKey,
-      });
-      applied += 1;
-    }
-    return applied;
-  }, [models]);
-
-  const alignRowsToPrimaryEndpoint = useCallback((rows: HomeModelRow[], nextModels: ModelRecord[]): HomeModelRow[] => {
-    if (rows.length === 0) {
-      return rows;
-    }
-    const primaryIndexRaw = rows.findIndex((item) => item.modelKey === "model");
-    const primaryIndex = primaryIndexRaw >= 0 ? primaryIndexRaw : 0;
-    const primary = rows[primaryIndex];
-    const primaryEndpointId = primary.endpointId;
-
-    const modelById = new Map(nextModels.map((item) => [item.id, item]));
-    const primaryModelsByModelId = new Map(
-      nextModels
-        .filter((item) => item.endpointId === primaryEndpointId)
-        .map((item) => [item.modelId, item.id]),
-    );
-
-    const primaryModelValid = nextModels.some(
-      (item) => item.id === primary.modelRecordId && item.endpointId === primaryEndpointId,
-    );
-    const normalizedPrimary = primaryModelValid
-      ? primary
-      : {
-          ...primary,
-          modelRecordId: "",
-        };
-
-    const primaryModelRecordId = normalizedPrimary.modelRecordId;
-
-    return rows.map((row, index) => {
-      if (index === primaryIndex || row.modelKey === "model") {
-        return index === primaryIndex ? normalizedPrimary : row;
-      }
-      let mappedModelRecordId = row.modelRecordId;
-      if (mappedModelRecordId) {
-        const selectedModel = modelById.get(mappedModelRecordId);
-        if (selectedModel) {
-          const sameModelInPrimary = primaryModelsByModelId.get(selectedModel.modelId);
-          if (sameModelInPrimary) {
-            mappedModelRecordId = sameModelInPrimary;
-          }
+  const modelIds = useMemo(() => models.map((item) => item.modelId).sort((a, b) => a.localeCompare(b)), [models]);
+  const modelIdSet = useMemo(() => new Set(modelIds), [modelIds]);
+  const modelMap = useMemo(() => new Map(models.map((item) => [item.modelId, item])), [models]);
+  const selectedAvailableModelCount = useMemo(
+    () => draftChain.filter((item) => modelIdSet.has(item)).length,
+    [draftChain, modelIdSet],
+  );
+  const allDraftModelsSelected = modelIds.length > 0 && selectedAvailableModelCount === modelIds.length;
+  const partiallyDraftModelsSelected = selectedAvailableModelCount > 0 && !allDraftModelsSelected;
+  const settingsSortedModels = useMemo(() => {
+    const next = models.slice();
+    if (settingsSort.field === "provider") {
+      next.sort((a, b) => {
+        const providerA = (a.provider || "").toLowerCase();
+        const providerB = (b.provider || "").toLowerCase();
+        const providerCmp = providerA.localeCompare(providerB);
+        if (providerCmp !== 0) {
+          return settingsSort.direction === "asc" ? providerCmp : -providerCmp;
         }
+        const nameCmp = a.modelId.localeCompare(b.modelId);
+        return settingsSort.direction === "asc" ? nameCmp : -nameCmp;
+      });
+      return next;
+    }
+    if (settingsSort.field === "name") {
+      next.sort((a, b) => {
+        const nameCmp = a.modelId.localeCompare(b.modelId);
+        return settingsSort.direction === "asc" ? nameCmp : -nameCmp;
+      });
+      return next;
+    }
+    next.sort((a, b) => {
+      const scoreA = modelScoreValueFromMeta(a.meta);
+      const scoreB = modelScoreValueFromMeta(b.meta);
+      if (scoreA === null && scoreB === null) {
+        return a.modelId.localeCompare(b.modelId);
       }
-      const modelValid = nextModels.some(
-        (item) => item.id === mappedModelRecordId && item.endpointId === primaryEndpointId,
-      );
-      return {
-        ...row,
-        endpointId: primaryEndpointId,
-        modelRecordId: modelValid ? mappedModelRecordId : primaryModelRecordId,
-      };
+      if (scoreA === null) {
+        return 1;
+      }
+      if (scoreB === null) {
+        return -1;
+      }
+      const diff = settingsSort.direction === "asc" ? scoreA - scoreB : scoreB - scoreA;
+      if (diff !== 0) {
+        return diff;
+      }
+      return a.modelId.localeCompare(b.modelId);
     });
-  }, []);
+    return next;
+  }, [models, settingsSort.direction, settingsSort.field]);
+  const settingsDisplayedModels = useMemo(() => {
+    const selected = draftChain
+      .map((modelId) => modelMap.get(modelId))
+      .filter((item): item is ModelRecord => Boolean(item));
+    const selectedIdSet = new Set(selected.map((item) => item.modelId));
+    const unselected = settingsSortedModels.filter((item) => !selectedIdSet.has(item.modelId));
+    return [...selected, ...unselected];
+  }, [draftChain, modelMap, settingsSortedModels]);
 
-  const buildHomeModelRows = useCallback(
-    (nextEndpoints: EndpointView[], nextModels: ModelRecord[], current: ClaudeCurrentState | null): HomeModelRow[] => {
-      const modelKeys = current?.env.modelKeys?.length
-        ? current.env.modelKeys
-        : [
-            "model",
-            "ANTHROPIC_MODEL",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            "CLAUDE_CODE_SUBAGENT_MODEL",
-          ];
-      const modelValues = current?.env.modelValues ?? {};
-      const currentClaudeBaseUrl = normalizeClaudeBaseUrl(current?.env.ANTHROPIC_BASE_URL);
-      const defaultEndpointId = nextEndpoints.find(
-        (item) => normalizeClaudeBaseUrl(item.baseUrl) === currentClaudeBaseUrl,
-      )?.id ?? nextEndpoints[0]?.id ?? "";
+  const loadData = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+    }
+    try {
+      const [nextEndpoints, nextAllModels, nextCurrent, nextCliproxyInfo, nextFallbackRows] = await Promise.all([
+        getEndpoints(),
+        getModels(),
+        getClaudeCurrent(),
+        getCliproxyConfigInfo(),
+        getFallbackChains(),
+      ]);
+      const nextEndpoint = resolveCliproxyEndpoint(nextEndpoints);
+      const nextModels = nextEndpoint
+        ? nextAllModels
+          .filter((item) => item.endpointId === nextEndpoint.id)
+          .sort((a, b) => a.displayName.localeCompare(b.displayName))
+        : [];
 
-      return modelKeys.map((modelKey) => {
-        const configuredModelId = modelValues[modelKey];
-        let endpointId = defaultEndpointId;
-        let modelRecordId = "";
+      const nextFallbackMap = chainMapFromRows(nextFallbackRows);
+      const available = new Set(nextModels.map((item) => item.modelId));
+      const keys = normalizeVariableKeys(nextCurrent, nextFallbackMap);
 
-        if (configuredModelId) {
-          const exact = nextModels.find(
-            (item) => item.endpointId === endpointId && item.modelId === configuredModelId,
-          );
-          if (exact) {
-            modelRecordId = exact.id;
-          } else {
-            const fallbackByModelId = nextModels.find((item) => item.modelId === configuredModelId);
-            if (fallbackByModelId) {
-              endpointId = fallbackByModelId.endpointId;
-              modelRecordId = fallbackByModelId.id;
-            }
-          }
+      for (const key of keys) {
+        const existing = (nextFallbackMap[key] ?? []).filter((item) => available.has(item));
+        if (existing.length) {
+          nextFallbackMap[key] = existing;
+          continue;
         }
+        const configured = nextCurrent?.env.modelValues?.[key];
+        if (configured && available.has(configured)) {
+          nextFallbackMap[key] = [configured];
+        }
+      }
 
-        return {
-          modelKey,
-          endpointId,
-          modelRecordId,
-        };
+      setEndpoint(nextEndpoint);
+      setModels(nextModels);
+      setScoringModelIdInput((prev) => {
+        if (prev && nextModels.some((item) => item.modelId === prev)) {
+          return prev;
+        }
+        return nextModels[0]?.modelId || "";
       });
-    },
-    [],
-  );
-
-  const loadData = useCallback(
-    async (silent = false) => {
-      if (!silent) {
-        setLoading(true);
-      }
-      try {
-        const [nextEndpoints, nextModels, nextClaudeCurrent, nextCliproxyConfigInfo] = await Promise.all([
-          getEndpoints(),
-          getModels(),
-          getClaudeCurrent(),
-          getCliproxyConfigInfo(),
-        ]);
-        setEndpoints(nextEndpoints);
-        setModels(nextModels);
-        setClaudeCurrent(nextClaudeCurrent);
-        setCliproxyConfigInfo(nextCliproxyConfigInfo);
-
-        setActiveMenu((prev) => {
-          const endpointId = menuToEndpointId(prev);
-          if (!endpointId) {
-            return prev;
-          }
-          if (endpointId === CURRENT_CONFIG_ENDPOINT_ID && nextClaudeCurrent?.env.ANTHROPIC_BASE_URL) {
-            return prev;
-          }
-          if (nextEndpoints.some((item) => item.id === endpointId)) {
-            return prev;
-          }
-          return "home";
-        });
-
-        const computedRows = buildHomeModelRows(nextEndpoints, nextModels, nextClaudeCurrent);
-        setHomeModelRows((prevRows) => {
-          const normalizeRows = (rows: HomeModelRow[]) => alignRowsToPrimaryEndpoint(rows, nextModels);
-          if (!homeRowsDirty) {
-            return normalizeRows(computedRows);
-          }
-
-          const endpointSet = new Set(nextEndpoints.map((item) => item.id));
-          const modelSet = new Set(nextModels.map((item) => item.id));
-          const prevByKey = new Map(prevRows.map((item) => [item.modelKey, item]));
-
-          const merged = computedRows.map((row) => {
-            const prev = prevByKey.get(row.modelKey);
-            if (!prev) {
-              return row;
-            }
-            if (!endpointSet.has(prev.endpointId)) {
-              return row;
-            }
-            if (!prev.modelRecordId) {
-              return {
-                ...row,
-                endpointId: prev.endpointId,
-                modelRecordId: "",
-              };
-            }
-            if (!modelSet.has(prev.modelRecordId)) {
-              return row;
-            }
-            return prev;
-          });
-          return normalizeRows(merged);
-        });
-      } catch (error) {
-        setError(error);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [alignRowsToPrimaryEndpoint, buildHomeModelRows, homeRowsDirty],
-  );
+      setClaudeCurrent(nextCurrent);
+      setCliproxyConfigInfo(nextCliproxyInfo);
+      setFallbackChains(nextFallbackMap);
+    } catch (error) {
+      setError(error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     void loadData();
@@ -324,58 +384,14 @@ function App() {
     return () => window.clearInterval(timer);
   }, [loadData]);
 
-  const virtualCurrentEndpoint = useMemo(() => {
-    if (!claudeCurrent?.env.ANTHROPIC_BASE_URL || !claudeCurrent.env.hasAuthToken) {
-      return null;
+  useEffect(() => {
+    if (selectAllDraftRef.current) {
+      selectAllDraftRef.current.indeterminate = partiallyDraftModelsSelected;
     }
-    const currentClaudeBaseUrl = normalizeClaudeBaseUrl(claudeCurrent.env.ANTHROPIC_BASE_URL);
-    const exists = endpoints.some((item) => normalizeClaudeBaseUrl(item.baseUrl) === currentClaudeBaseUrl);
-    if (exists) {
-      return null;
-    }
-    const now = new Date().toISOString();
-    const baseUrl = claudeCurrent.env.ANTHROPIC_BASE_URL;
-    return {
-      id: CURRENT_CONFIG_ENDPOINT_ID,
-      name: inferCurrentEndpointName(baseUrl),
-      baseUrl,
-      protocol: "anthropic",
-      enabled: true,
-      dynamicEnabled: false,
-      pollingIntervalSec: 30,
-      lastSyncStatus: "idle" as const,
-      lastSyncAt: undefined,
-      lastSyncError: undefined,
-      createdAt: now,
-      updatedAt: now,
-      apiKeyMasked: claudeCurrent.env.ANTHROPIC_AUTH_TOKEN_MASKED || "",
-      hasApiKey: claudeCurrent.env.hasAuthToken,
-    } satisfies EndpointView;
-  }, [claudeCurrent, endpoints]);
+  }, [partiallyDraftModelsSelected]);
 
-  const menuEndpoints = useMemo(
-    () => (virtualCurrentEndpoint ? [virtualCurrentEndpoint, ...endpoints] : endpoints),
-    [endpoints, virtualCurrentEndpoint],
-  );
+  const variableKeys = useMemo(() => normalizeVariableKeys(claudeCurrent, fallbackChains), [claudeCurrent, fallbackChains]);
 
-  const endpointMap = useMemo(
-    () => new Map(menuEndpoints.map((endpoint) => [endpoint.id, endpoint])),
-    [menuEndpoints],
-  );
-
-  const selectedEndpointIdFromMenu = useMemo(() => menuToEndpointId(activeMenu), [activeMenu]);
-  const selectedEndpoint = useMemo(
-    () => (selectedEndpointIdFromMenu ? endpointMap.get(selectedEndpointIdFromMenu) ?? null : null),
-    [endpointMap, selectedEndpointIdFromMenu],
-  );
-  const isCliproxyLocalPage = useMemo(() => isCliproxyLocalEndpoint(selectedEndpoint), [selectedEndpoint]);
-  const isOpenAiResponsesPage = useMemo(() => isOpenAiResponsesEndpoint(selectedEndpoint), [selectedEndpoint]);
-  const canManageEndpointConfig = Boolean(
-    selectedEndpointIdFromMenu
-      && selectedEndpointIdFromMenu !== CURRENT_CONFIG_ENDPOINT_ID
-      && !isCliproxyLocalPage,
-  );
-  const canManageManualModels = canManageEndpointConfig;
   const currentModelEntries = useMemo(() => {
     const keys = claudeCurrent?.env.modelKeys ?? [];
     const values = claudeCurrent?.env.modelValues ?? {};
@@ -384,6 +400,7 @@ function App() {
       value: values[key] || "未配置",
     }));
   }, [claudeCurrent]);
+
   const homeConfigLines = useMemo(() => {
     const lines: Array<{ key: string; value: string }> = [
       {
@@ -408,219 +425,67 @@ function App() {
     return lines;
   }, [claudeCurrent, currentModelEntries]);
 
-  const endpointModels = useMemo(() => {
-    if (!selectedEndpointIdFromMenu) {
-      return [];
+  const displayedModels = useMemo(() => {
+    const next = models.slice();
+    if (scoreSortOrder === "none") {
+      return next;
     }
-    return models
-      .filter((model) => model.endpointId === selectedEndpointIdFromMenu)
-      .sort((a, b) => a.displayName.localeCompare(b.displayName));
-  }, [models, selectedEndpointIdFromMenu]);
-  const localGatewayGuideText = useMemo(() => {
-    if (!isOpenAiResponsesPage) {
-      return "";
+    next.sort((a, b) => {
+      const scoreA = modelScoreValueFromMeta(a.meta);
+      const scoreB = modelScoreValueFromMeta(b.meta);
+      if (scoreA === null && scoreB === null) {
+        return a.displayName.localeCompare(b.displayName);
+      }
+      if (scoreA === null) {
+        return 1;
+      }
+      if (scoreB === null) {
+        return -1;
+      }
+      const diff = scoreSortOrder === "desc" ? scoreB - scoreA : scoreA - scoreB;
+      if (diff !== 0) {
+        return diff;
+      }
+      return a.displayName.localeCompare(b.displayName);
+    });
+    return next;
+  }, [models, scoreSortOrder]);
+
+  const scoreSortIcon = scoreSortOrder === "desc" ? "↓" : scoreSortOrder === "asc" ? "↑" : "↕";
+
+  const closeSettingsModal = () => {
+    setSettingsOpen(false);
+    setSettingsModelKey("");
+    setDraftChain([]);
+    setDraggingModelId(null);
+    setSettingsSort({ field: "score", direction: "desc" });
+  };
+
+  const persistChain = useCallback(async (modelKey: string, nextChain: string[], successText: string) => {
+    const normalized = nextChain.filter((item, index) => item && modelIdSet.has(item) && nextChain.indexOf(item) === index);
+    if (!normalized.length) {
+      throw new Error("fallback chain 至少保留一个模型。");
     }
-    return [
-      "OpenAI Responses 协议已由当前服务内置转换，不需要额外启动 ccNexus。",
-      "在首页选择该 endpoint 的模型后，会自动写入 Claude Code：",
-      "ANTHROPIC_BASE_URL=http://127.0.0.1:3199",
-      "ANTHROPIC_AUTH_TOKEN=mm_ep_<endpoint-id>",
-      "ANTHROPIC_MODEL=<你选择的模型>",
-    ].join("\n");
-  }, [isOpenAiResponsesPage]);
+    const updated = await updateFallbackChain(modelKey, normalized);
+    setFallbackChains((prev) => ({
+      ...prev,
+      [updated.modelKey]: updated.priorityList,
+    }));
+    await loadData(true);
+    setSuccess(successText);
+  }, [loadData, modelIdSet]);
 
-  const handleHomeRowEndpointChange = (rowIndex: number, endpointId: string) => {
-    setHomeRowsDirty(true);
-    setHomeModelRows((prev) => {
-      if (!prev[rowIndex]) {
-        return prev;
+  const handleToggleScoreSort = () => {
+    setScoreSortOrder((prev) => {
+      if (prev === "none") {
+        return "desc";
       }
-      const currentPrimary = prev[rowIndex];
-      let nextPrimaryModelRecordId = "";
-      if (currentPrimary.modelRecordId) {
-        const currentPrimaryModel = models.find((item) => item.id === currentPrimary.modelRecordId);
-        if (currentPrimaryModel) {
-          const mapped = models.find(
-            (item) => item.endpointId === endpointId && item.modelId === currentPrimaryModel.modelId,
-          );
-          nextPrimaryModelRecordId = mapped?.id ?? "";
-        }
+      if (prev === "desc") {
+        return "asc";
       }
-
-      const draft = prev.map((row, idx) => (idx === rowIndex
-        ? {
-            ...row,
-            endpointId,
-            modelRecordId: nextPrimaryModelRecordId,
-          }
-        : row));
-      return alignRowsToPrimaryEndpoint(draft, models);
+      return "none";
     });
   };
-
-  const handleHomeRowModelChange = async (rowIndex: number, modelRecordId: string) => {
-    const row = homeModelRows[rowIndex];
-    if (!row) {
-      return;
-    }
-    const primaryRow = homeModelRows.find((item) => item.modelKey === "model") ?? homeModelRows[0];
-    const primaryEndpointId = primaryRow?.endpointId ?? "";
-    const model = models.find((item) => item.id === modelRecordId);
-    if (!model) {
-      return;
-    }
-    if (row.modelKey !== "model" && primaryEndpointId && model.endpointId !== primaryEndpointId) {
-      return;
-    }
-    const draftRows = homeModelRows.map((item, idx) => (idx === rowIndex
-      ? {
-          ...item,
-          endpointId: model.endpointId,
-          modelRecordId,
-        }
-      : item));
-    const nextRows = alignRowsToPrimaryEndpoint(draftRows, models);
-    setHomeModelRows(nextRows);
-    setSubmitting(true);
-    try {
-      if (row.modelKey === "model") {
-        const applied = await applyRowsToClaude(nextRows);
-        setSuccess(`已自动保存 ${applied} 项模型配置`);
-      } else {
-        await applyClaudeConfig({
-          endpointId: model.endpointId,
-          modelRecordId,
-          modelKey: row.modelKey,
-        });
-        setSuccess(`已自动保存 ${row.modelKey} = ${model.modelId}`);
-      }
-      setHomeRowsDirty(false);
-      await loadData(true);
-    } catch (error) {
-      setError(error);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleRefreshByMenu = async () => {
-    setSubmitting(true);
-    try {
-      const endpointId = menuToEndpointId(activeMenu);
-      if (endpointId) {
-        if (endpointId === CURRENT_CONFIG_ENDPOINT_ID) {
-          await loadData(true);
-          setSuccess("当前配置 Endpoint 已更新。");
-          return;
-        }
-        await refreshEndpoint(endpointId);
-        await loadData(true);
-        setSuccess("Endpoint 模型已刷新。");
-      }
-    } catch (error) {
-      setError(error);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleCreateEndpoint = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!newEndpoint.name || !newEndpoint.baseUrl || !newEndpoint.apiKey) {
-      setError(new Error("请填写 endpoint name / baseUrl / apiKey"));
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const created = await createEndpoint({
-        name: newEndpoint.name,
-        baseUrl: newEndpoint.baseUrl,
-        apiKey: newEndpoint.apiKey,
-        protocol: newEndpoint.protocol,
-        dynamicEnabled: true,
-        enabled: true,
-      });
-      setNewEndpoint(defaultEndpointForm);
-      setShowAddEndpointModal(false);
-      await loadData(true);
-      setActiveMenu(`endpoint:${created.id}`);
-      setSuccess(`已添加 endpoint: ${created.name}`);
-    } catch (error) {
-      setError(error);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleCreateManualModel = async (event: FormEvent) => {
-    event.preventDefault();
-    const endpointId = selectedEndpointIdFromMenu;
-    if (!endpointId) {
-      return;
-    }
-    if (endpointId === CURRENT_CONFIG_ENDPOINT_ID) {
-      setError(new Error("当前配置 Endpoint 不支持直接新增手动模型。"));
-      return;
-    }
-    if (!manualModelForm.modelId) {
-      setError(new Error("请填写 model id"));
-      return;
-    }
-    setSubmitting(true);
-    try {
-      await createManualModel({
-        endpointId,
-        modelId: manualModelForm.modelId,
-        displayName: manualModelForm.displayName || undefined,
-        provider: manualModelForm.provider || undefined,
-      });
-      setManualModelForm({
-        modelId: "",
-        displayName: "",
-        provider: "",
-      });
-      await loadData(true);
-      setSuccess("手动模型已添加。");
-    } catch (error) {
-      setError(error);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  useEffect(() => {
-    if (!selectedEndpointIdFromMenu || selectedEndpointIdFromMenu === CURRENT_CONFIG_ENDPOINT_ID) {
-      return;
-    }
-    const endpoint = endpointMap.get(selectedEndpointIdFromMenu);
-    if (!endpoint || isCliproxyLocalEndpoint(endpoint)) {
-      return;
-    }
-    let cancelled = false;
-    setEndpointConfigForm({
-      baseUrl: endpoint.baseUrl,
-      apiKey: "",
-      protocol: endpoint.protocol,
-    });
-    void (async () => {
-      try {
-        const apiKey = await getEndpointApiKey(selectedEndpointIdFromMenu);
-        if (cancelled) {
-          return;
-        }
-        setEndpointConfigForm({
-          baseUrl: endpoint.baseUrl,
-          apiKey,
-          protocol: endpoint.protocol,
-        });
-      } catch {
-        // Keep empty when secret read fails.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [endpointMap, selectedEndpointIdFromMenu]);
 
   const handleChooseCliproxyConfigFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -658,12 +523,17 @@ function App() {
     }
   };
 
-  const handleRefreshCliproxyConfigInfo = async () => {
+  const handleRefreshCliproxy = async () => {
+    if (!endpoint) {
+      return;
+    }
     setSubmitting(true);
     try {
+      await refreshEndpoint(endpoint.id);
       const info = await getCliproxyConfigInfo();
       setCliproxyConfigInfo(info);
-      setSuccess("已刷新 cliproxy 配置文件状态。");
+      await loadData(true);
+      setSuccess("CLIProxy 模型和配置状态已刷新。");
     } catch (error) {
       setError(error);
     } finally {
@@ -671,43 +541,154 @@ function App() {
     }
   };
 
-  const handleUpdateEndpointConfig = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!selectedEndpointIdFromMenu || selectedEndpointIdFromMenu === CURRENT_CONFIG_ENDPOINT_ID) {
+  const handleScoreAllModels = async () => {
+    if (!models.length) {
       return;
     }
-    if (!endpointConfigForm.baseUrl) {
-      setError(new Error("base url 不能为空"));
-      return;
-    }
+    setIsScoringModels(true);
     setSubmitting(true);
     try {
-      const updated = await updateEndpoint(selectedEndpointIdFromMenu, {
-        baseUrl: endpointConfigForm.baseUrl,
-        apiKey: endpointConfigForm.apiKey || undefined,
-        protocol: endpointConfigForm.protocol,
+      const result = await scoreModels({
+        scoringModelId: scoringModelIdInput || undefined,
       });
-      setEndpoints((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
-      setEndpointConfigForm((prev) => ({
-        ...prev,
-        protocol: updated.protocol,
-        apiKey: "",
-      }));
-      await loadData(true);
-      setSuccess(`Endpoint 已更新，当前协议: ${updated.protocol}`);
+      setModels(
+        result.models
+          .slice()
+          .sort((a, b) => a.displayName.localeCompare(b.displayName)),
+      );
+      const changedText = typeof result.changedCount === "number"
+        ? `，变化 ${result.changedCount} 个`
+        : "";
+      const sourceText = result.source ? `（${result.source}）` : "";
+      setSuccess(`模型评分完成${sourceText}，共处理 ${result.updatedCount} 个模型${changedText}。`);
     } catch (error) {
       setError(error);
     } finally {
+      setIsScoringModels(false);
       setSubmitting(false);
     }
   };
 
-  const handleDeleteManualModel = async (modelId: string) => {
+  const openSettingsModal = (modelKey: string) => {
+    const chain = (fallbackChains[modelKey] ?? []).filter((item) => modelIdSet.has(item));
+    setSettingsModelKey(modelKey);
+    setDraftChain(chain);
+    setSettingsSort({ field: "score", direction: "desc" });
+    setSettingsOpen(true);
+  };
+
+  const settingsHeaderIcon = (field: "score" | "provider" | "name"): string => {
+    if (settingsSort.field !== field) {
+      return "↕";
+    }
+    return settingsSort.direction === "asc" ? "↑" : "↓";
+  };
+
+  const handleSettingsHeaderSort = (field: "score" | "provider" | "name") => {
+    setSettingsSort((prev) => {
+      if (prev.field === field) {
+        return {
+          field,
+          direction: prev.direction === "asc" ? "desc" : "asc",
+        };
+      }
+      return {
+        field,
+        direction: field === "score" ? "desc" : "asc",
+      };
+    });
+  };
+
+  const toggleDraftModel = (modelId: string, checked: boolean) => {
+    setDraftChain((prev) => {
+      const exists = prev.includes(modelId);
+      if (checked) {
+        if (exists) {
+          return prev;
+        }
+        return [...prev, modelId];
+      }
+      if (!exists) {
+        return prev;
+      }
+      return prev.filter((item) => item !== modelId);
+    });
+  };
+
+  const handleToggleAllDraftModels = (checked: boolean) => {
+    setDraftChain((prev) => {
+      if (!checked) {
+        return [];
+      }
+      const validPrev = prev.filter((item, index) => modelIdSet.has(item) && prev.indexOf(item) === index);
+      const picked = new Set(validPrev);
+      const missing = modelIds.filter((item) => !picked.has(item));
+      return [...validPrev, ...missing];
+    });
+  };
+
+  const reorderDraftChain = (sourceModelId: string, targetModelId: string) => {
+    setDraftChain((prev) => {
+      const sourceIndex = prev.indexOf(sourceModelId);
+      const targetIndex = prev.indexOf(targetModelId);
+      if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) {
+        return prev;
+      }
+      const next = prev.slice();
+      const [moved] = next.splice(sourceIndex, 1);
+      next.splice(targetIndex, 0, moved);
+      return next;
+    });
+  };
+
+  const handleDraftRowDragStart = (event: DragEvent<HTMLTableRowElement>, modelId: string) => {
+    if (submitting || !draftChain.includes(modelId)) {
+      return;
+    }
+    setDraggingModelId(modelId);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData(DRAFT_CHAIN_DRAG_TYPE, modelId);
+  };
+
+  const handleDraftRowDragOver = (event: DragEvent<HTMLTableRowElement>, targetModelId: string) => {
+    const sourceModelId = event.dataTransfer.getData(DRAFT_CHAIN_DRAG_TYPE) || draggingModelId;
+    if (!sourceModelId || sourceModelId === targetModelId) {
+      return;
+    }
+    if (!draftChain.includes(sourceModelId) || !draftChain.includes(targetModelId)) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+  };
+
+  const handleDraftRowDrop = (event: DragEvent<HTMLTableRowElement>, targetModelId: string) => {
+    event.preventDefault();
+    const sourceModelId = event.dataTransfer.getData(DRAFT_CHAIN_DRAG_TYPE) || draggingModelId;
+    if (!sourceModelId || sourceModelId === targetModelId) {
+      setDraggingModelId(null);
+      return;
+    }
+    reorderDraftChain(sourceModelId, targetModelId);
+    setDraggingModelId(null);
+  };
+
+  const handleDraftRowDragEnd = () => {
+    setDraggingModelId(null);
+  };
+
+  const handleSaveDraftChain = async () => {
+    if (!settingsModelKey) {
+      return;
+    }
+    if (!draftChain.length) {
+      setError(new Error("请至少选择一个模型。"));
+      return;
+    }
     setSubmitting(true);
     try {
-      await deleteManualModel(modelId);
-      await loadData(true);
-      setSuccess("手动模型已删除。");
+      await persistChain(settingsModelKey, draftChain, `已保存 ${settingsModelKey} 的 fallback chain，并自动更新 Claude 配置。`);
+      closeSettingsModal();
     } catch (error) {
       setError(error);
     } finally {
@@ -715,62 +696,24 @@ function App() {
     }
   };
 
-  const renderModelList = (title: string, rows: ModelRecord[]) => {
-    return (
-      <div className="content-card">
-        <div className="content-head">
-          <h2>{title}</h2>
-          <button
-            className="icon-btn"
-            disabled={submitting}
-            onClick={() => void handleRefreshByMenu()}
-            title="刷新模型列表"
-            type="button"
-          >
-            ↻
-          </button>
-        </div>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Model ID</th>
-                <th>显示名</th>
-                <th>Provider</th>
-                <th>来源</th>
-                <th>状态</th>
-                {canManageManualModels && <th></th>}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((model) => (
-                <tr key={model.id}>
-                  <td>{model.modelId}</td>
-                  <td>{model.displayName}</td>
-                  <td>{model.provider || "-"}</td>
-                  <td>{model.source}</td>
-                  <td>{model.enabled ? "enabled" : "disabled"}</td>
-                  {canManageManualModels && (
-                    <td>
-                      {model.source === "manual" ? (
-                        <button
-                          className="danger ghost"
-                          disabled={submitting}
-                          onClick={() => void handleDeleteManualModel(model.id)}
-                          type="button"
-                        >
-                          删除
-                        </button>
-                      ) : null}
-                    </td>
-                  )}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    );
+  const handleRemoveFallbackModel = async (modelKey: string, modelId: string) => {
+    const chain = fallbackChains[modelKey] ?? [];
+    if (!chain.includes(modelId)) {
+      return;
+    }
+    if (chain.length <= 1) {
+      setError(new Error("fallback chain 至少保留一个模型。"));
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const next = chain.filter((item) => item !== modelId);
+      await persistChain(modelKey, next, `已更新 ${modelKey} 的 fallback chain，并自动更新 Claude 配置。`);
+    } catch (error) {
+      setError(error);
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   if (loading) {
@@ -798,22 +741,12 @@ function App() {
           >
             首页
           </button>
-          {menuEndpoints.map((endpoint) => (
-            <button
-              className={activeMenu === `endpoint:${endpoint.id}` ? "menu-item active" : "menu-item"}
-              key={endpoint.id}
-              onClick={() => setActiveMenu(`endpoint:${endpoint.id}`)}
-              type="button"
-            >
-              {endpoint.name}
-            </button>
-          ))}
           <button
-            className="menu-item add-item"
-            onClick={() => setShowAddEndpointModal(true)}
+            className={activeMenu === "cliproxy" ? "menu-item active" : "menu-item"}
+            onClick={() => setActiveMenu("cliproxy")}
             type="button"
           >
-            + 添加 Endpoint
+            CLIProxy Local
           </button>
         </nav>
       </aside>
@@ -823,6 +756,13 @@ function App() {
           <div className={`notice ${message.type}`}>
             {message.text}
           </div>
+        )}
+
+        {!endpoint && (
+          <section className="content-card">
+            <h2>CLIProxy Local</h2>
+            <p className="muted">当前未检测到可用的 CLIProxy endpoint，请在 CLIProxy Local 页面导入配置。</p>
+          </section>
         )}
 
         {activeMenu === "home" && (
@@ -835,240 +775,322 @@ function App() {
                   <div className="config-value">{line.value}</div>
                 </div>
               ))}
-              </div>
+            </div>
 
-            {homeModelRows.map((row, rowIndex) => {
-              const primaryRow = homeModelRows.find((item) => item.modelKey === "model") ?? homeModelRows[0];
-              const primaryEndpointId = primaryRow?.endpointId ?? "";
-              const isPrimaryRow = row.modelKey === "model";
-              const effectiveEndpointId = isPrimaryRow ? row.endpointId : primaryEndpointId;
-              const effectiveEndpoint = endpoints.find((item) => item.id === effectiveEndpointId);
-              const rowOptions = models
-                .filter((item) => item.endpointId === effectiveEndpointId)
-                .sort((a, b) => a.displayName.localeCompare(b.displayName));
+            {variableKeys.map((modelKey) => {
+              const chain = fallbackChains[modelKey] ?? [];
+              const current = chain[0] || "未设置";
               return (
-                <div className="config-row" key={row.modelKey}>
-                  <label>{row.modelKey}</label>
-                  {isPrimaryRow ? (
-                    <select
-                      disabled={submitting}
-                      value={effectiveEndpointId}
-                      onChange={(event) => {
-                        void handleHomeRowEndpointChange(rowIndex, event.target.value);
-                      }}
-                    >
-                      <option value="">选择 Endpoint</option>
-                      {endpoints.map((endpoint) => (
-                        <option key={endpoint.id} value={endpoint.id}>
-                          {endpoint.name}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <select
-                      disabled
-                      value={effectiveEndpointId}
-                    >
-                      <option value={effectiveEndpointId}>
-                        {effectiveEndpoint?.name || "跟随 model 的 endpoint"}
-                      </option>
-                    </select>
-                  )}
-                  <select
-                    disabled={submitting || !effectiveEndpointId}
-                    value={row.modelRecordId}
-                    onChange={(event) => {
-                      void handleHomeRowModelChange(rowIndex, event.target.value);
-                    }}
-                  >
-                    <option value="">选择模型</option>
-                    {rowOptions.map((model) => (
-                      <option key={model.id} value={model.id}>
-                        {model.modelId}
-                      </option>
-                    ))}
-                  </select>
+                <div className="home-row-block" key={modelKey}>
+                  <div className="config-row">
+                    <label>{modelKey}</label>
+                    <div className="variable-head">
+                      <span className="variable-current">当前: {current}</span>
+                      <button
+                        disabled={submitting || !models.length}
+                        onClick={() => {
+                          openSettingsModal(modelKey);
+                        }}
+                        type="button"
+                      >
+                        设置
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="fallback-line">
+                    <div className="config-key">Fallback Chain</div>
+                    <div className="fallback-chip-list">
+                      {chain.length ? chain.map((modelId, index) => (
+                        <span className="fallback-chip" key={`${modelKey}:${modelId}`}>
+                          <span>{modelId}</span>
+                          {index === 0 ? <em>当前</em> : null}
+                          <button
+                            disabled={submitting || chain.length <= 1}
+                            onClick={() => {
+                              void handleRemoveFallbackModel(modelKey, modelId);
+                            }}
+                            title="移除"
+                            type="button"
+                          >
+                            ×
+                          </button>
+                        </span>
+                      )) : <span className="muted">未设置</span>}
+                    </div>
+                  </div>
                 </div>
               );
             })}
           </section>
         )}
 
-        {selectedEndpointIdFromMenu && (
+        {activeMenu === "cliproxy" && (
           <>
-            {canManageEndpointConfig && (
-              <section className="content-card">
-                <h3>Endpoint 配置</h3>
-                <p className="muted">Endpoint: {selectedEndpoint?.name || selectedEndpointIdFromMenu}</p>
-                <form className="inline-form" onSubmit={handleUpdateEndpointConfig}>
+            <section className="content-card">
+              <div className="content-head">
+                <h2>CLIProxy 配置文件</h2>
+                <button
+                  className="icon-btn"
+                  disabled={submitting || !endpoint}
+                  onClick={() => {
+                    void handleRefreshCliproxy();
+                  }}
+                  title="刷新模型与配置状态"
+                  type="button"
+                >
+                  ↻
+                </button>
+              </div>
+              <div className="config-lines">
+                <div className="config-line">
+                  <div className="config-key">当前 Endpoint</div>
+                  <div className="config-value">{endpoint?.name || CLIPROXY_LOCAL_NAME}</div>
+                </div>
+                <div className="config-line">
+                  <div className="config-key">当前 Base URL</div>
+                  <div className="config-value">{endpoint?.baseUrl || "未配置"}</div>
+                </div>
+                <div className="config-line">
+                  <div className="config-key">自动发现配置</div>
+                  <div className="config-value">{cliproxyConfigInfo.found ? cliproxyConfigInfo.configPath : "未发现"}</div>
+                </div>
+                <div className="config-line">
+                  <div className="config-key">发现的 Base URL</div>
+                  <div className="config-value">{cliproxyConfigInfo.baseUrl || "未解析"}</div>
+                </div>
+              </div>
+              <div className="inline-form">
+                <input
+                  accept=".yaml,.yml"
+                  onChange={(event) => {
+                    void handleChooseCliproxyConfigFile(event);
+                  }}
+                  type="file"
+                />
+                <button
+                  disabled={submitting || !selectedCliproxyConfigContent}
+                  onClick={() => {
+                    void handleImportSelectedCliproxyConfig();
+                  }}
+                  type="button"
+                >
+                  导入所选配置
+                </button>
+              </div>
+              <p className="muted">
+                已选择文件: {selectedCliproxyConfigName || "未选择"}
+              </p>
+            </section>
+
+            <section className="content-card">
+              <div className="content-head">
+                <h3>CLIProxy 模型列表</h3>
+                <div className="toolbar">
                   <select
-                    value={endpointConfigForm.protocol}
-                    onChange={(event) =>
-                      setEndpointConfigForm((prev) => ({
-                        ...prev,
-                        protocol: event.target.value as EndpointProtocol,
-                      }))}
-                  >
-                    <option value="anthropic">Anthropic /v1/messages</option>
-                    <option value="openai_responses">OpenAI /v1/responses（内置转换）</option>
-                  </select>
-                  <input
-                    value={endpointConfigForm.baseUrl}
-                    placeholder="base url"
-                    onChange={(event) => setEndpointConfigForm((prev) => ({ ...prev, baseUrl: event.target.value }))}
-                  />
-                  <input
-                    type="text"
-                    value={endpointConfigForm.apiKey}
-                    placeholder="new api key (可选，不填则不改)"
-                    onChange={(event) => setEndpointConfigForm((prev) => ({ ...prev, apiKey: event.target.value }))}
-                  />
-                  <button disabled={submitting} type="submit">保存 Endpoint 配置</button>
-                </form>
-              </section>
-            )}
-            {isOpenAiResponsesPage && (
-              <section className="content-card">
-                <div className="content-head">
-                  <h3>Claude Code 接入（内置协议转换）</h3>
-                </div>
-                <p className="muted">
-                  当前 endpoint 协议是 OpenAI Responses。Claude Code 会通过当前服务内置网关接入。
-                </p>
-                <pre className="code-block">{localGatewayGuideText}</pre>
-              </section>
-            )}
-            {isCliproxyLocalPage && (
-              <section className="content-card">
-                <div className="content-head">
-                  <h3>CLIProxy 配置文件</h3>
-                  <button
-                    className="icon-btn"
-                    disabled={submitting}
-                    onClick={() => void handleRefreshCliproxyConfigInfo()}
-                    title="刷新配置文件状态"
-                    type="button"
-                  >
-                    ↻
-                  </button>
-                </div>
-                <div className="config-lines">
-                  <div className="config-line">
-                    <div className="config-key">自动发现配置</div>
-                    <div className="config-value">{cliproxyConfigInfo.found ? cliproxyConfigInfo.configPath : "未发现"}</div>
-                  </div>
-                  <div className="config-line">
-                    <div className="config-key">配置 Base URL</div>
-                    <div className="config-value">{cliproxyConfigInfo.baseUrl || "未解析"}</div>
-                  </div>
-                </div>
-                <div className="inline-form">
-                  <input
-                    accept=".yaml,.yml"
+                    disabled={submitting || !models.length}
                     onChange={(event) => {
-                      void handleChooseCliproxyConfigFile(event);
+                      setScoringModelIdInput(event.target.value);
                     }}
-                    type="file"
-                  />
+                    value={scoringModelIdInput}
+                  >
+                    {models.map((model) => (
+                      <option key={model.id} value={model.modelId}>
+                        {model.modelId}
+                      </option>
+                    ))}
+                  </select>
                   <button
-                    disabled={submitting || !selectedCliproxyConfigContent}
-                    onClick={() => void handleImportSelectedCliproxyConfig()}
+                    disabled={submitting || !models.length}
+                    onClick={() => {
+                      void handleScoreAllModels();
+                    }}
                     type="button"
                   >
-                    导入所选配置
+                    {isScoringModels ? "评分中..." : "模型评分"}
                   </button>
                 </div>
-                <p className="muted">
-                  已选择文件: {selectedCliproxyConfigName || "未选择"}
-                </p>
-              </section>
-            )}
-            {renderModelList(
-              `${endpointMap.get(selectedEndpointIdFromMenu)?.name || "Endpoint"} 模型列表`,
-              endpointModels,
-            )}
-            {canManageManualModels && (
-              <section className="content-card">
-                <h3>手动添加模型</h3>
-                <form className="inline-form" onSubmit={handleCreateManualModel}>
-                  <input
-                    value={manualModelForm.modelId}
-                    placeholder="model id"
-                    onChange={(event) => setManualModelForm((prev) => ({ ...prev, modelId: event.target.value }))}
-                  />
-                  <input
-                    value={manualModelForm.displayName}
-                    placeholder="display name"
-                    onChange={(event) =>
-                      setManualModelForm((prev) => ({ ...prev, displayName: event.target.value }))
-                    }
-                  />
-                  <input
-                    value={manualModelForm.provider}
-                    placeholder="provider"
-                    onChange={(event) => setManualModelForm((prev) => ({ ...prev, provider: event.target.value }))}
-                  />
-                  <button disabled={submitting} type="submit">添加</button>
-                </form>
-                <p className="muted">
-                  最后同步时间: {formatTime(endpointMap.get(selectedEndpointIdFromMenu)?.lastSyncAt)}
-                </p>
-              </section>
-            )}
+              </div>
+              <p className="muted">最后同步时间: {formatTime(endpoint?.lastSyncAt)}</p>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Model ID</th>
+                      <th>显示名</th>
+                      <th>Provider</th>
+                      <th>额度</th>
+                      <th>下次更新</th>
+                      <th>
+                        <button
+                          className="th-sort-btn"
+                          onClick={handleToggleScoreSort}
+                          title="按评分排序"
+                          type="button"
+                        >
+                          评分 {scoreSortIcon}
+                        </button>
+                      </th>
+                      <th>状态</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {displayedModels.map((model) => (
+                      <tr key={model.id}>
+                        <td>{model.modelId}</td>
+                        <td>{model.displayName}</td>
+                        <td>{model.provider || "-"}</td>
+                        <td>{quotaFromModelMeta(model.meta)}</td>
+                        <td>{quotaResetTimeFromModelMeta(model.meta)}</td>
+                        <td>{modelScoreFromMeta(model.meta)}</td>
+                        <td>{model.enabled ? "enabled" : "disabled"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
           </>
         )}
       </main>
-      {showAddEndpointModal && (
+
+      {settingsOpen && (
         <div
           className="modal-backdrop"
           onClick={() => {
             if (!submitting) {
-              setShowAddEndpointModal(false);
+              closeSettingsModal();
             }
           }}
         >
           <div
-            className="modal-card"
+            className="modal-card model-settings-modal"
             onClick={(event) => event.stopPropagation()}
           >
-            <h3>添加 Endpoint</h3>
-            <form className="modal-form" onSubmit={handleCreateEndpoint}>
-              <select
-                value={newEndpoint.protocol}
-                onChange={(event) =>
-                  setNewEndpoint((prev) => ({ ...prev, protocol: event.target.value as EndpointProtocol }))}
+            <h3>设置模型链</h3>
+            <p className="muted mono">变量: {settingsModelKey}</p>
+            <p className="muted">可多选；已选模型会自动置顶，可拖动已选行调整顺序。链路首项会自动写回 Claude 当前模型。</p>
+
+            <div className="table-wrap model-settings-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>
+                      <input
+                        aria-label="全选模型"
+                        checked={allDraftModelsSelected}
+                        disabled={submitting || !modelIds.length}
+                        onChange={(event) => {
+                          handleToggleAllDraftModels(event.target.checked);
+                        }}
+                        ref={selectAllDraftRef}
+                        title="全选 / 取消全选"
+                        type="checkbox"
+                      />
+                    </th>
+                    <th>
+                      <button
+                        className="th-sort-btn"
+                        onClick={() => {
+                          handleSettingsHeaderSort("name");
+                        }}
+                        title="按模型名称排序"
+                        type="button"
+                      >
+                        Model ID {settingsHeaderIcon("name")}
+                      </button>
+                    </th>
+                    <th>
+                      <button
+                        className="th-sort-btn"
+                        onClick={() => {
+                          handleSettingsHeaderSort("provider");
+                        }}
+                        title="按 Provider 排序"
+                        type="button"
+                      >
+                        Provider {settingsHeaderIcon("provider")}
+                      </button>
+                    </th>
+                    <th>
+                      <button
+                        className="th-sort-btn"
+                        onClick={() => {
+                          handleSettingsHeaderSort("score");
+                        }}
+                        title="按评分排序"
+                        type="button"
+                      >
+                        评分 {settingsHeaderIcon("score")}
+                      </button>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {settingsDisplayedModels.map((model) => {
+                    const modelId = model.modelId;
+                    const selected = draftChain.includes(modelId);
+                    const rowClassName = [
+                      selected ? "settings-row-selected settings-row-draggable" : "",
+                      draggingModelId === modelId ? "settings-row-dragging" : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" ");
+                    return (
+                      <tr
+                        className={rowClassName || undefined}
+                        draggable={selected && !submitting}
+                        key={modelId}
+                        onDragEnd={handleDraftRowDragEnd}
+                        onDragOver={(event) => {
+                          handleDraftRowDragOver(event, modelId);
+                        }}
+                        onDragStart={(event) => {
+                          handleDraftRowDragStart(event, modelId);
+                        }}
+                        onDrop={(event) => {
+                          handleDraftRowDrop(event, modelId);
+                        }}
+                      >
+                        <td>
+                          <input
+                            checked={selected}
+                            disabled={submitting}
+                            onChange={(event) => {
+                              toggleDraftModel(modelId, event.target.checked);
+                            }}
+                            type="checkbox"
+                          />
+                        </td>
+                        <td>{selected ? `↕ ${modelId}` : modelId}</td>
+                        <td>{model.provider || "-"}</td>
+                        <td>{modelScoreFromMeta(model.meta)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="modal-actions">
+              <button
+                className="ghost-btn"
+                disabled={submitting}
+                onClick={closeSettingsModal}
+                type="button"
               >
-                <option value="anthropic">Anthropic /v1/messages</option>
-                <option value="openai_responses">OpenAI /v1/responses（内置转换）</option>
-              </select>
-              <input
-                value={newEndpoint.name}
-                placeholder="endpoint name"
-                onChange={(event) => setNewEndpoint((prev) => ({ ...prev, name: event.target.value }))}
-              />
-              <input
-                value={newEndpoint.baseUrl}
-                placeholder="base url"
-                onChange={(event) => setNewEndpoint((prev) => ({ ...prev, baseUrl: event.target.value }))}
-              />
-              <input
-                type="text"
-                value={newEndpoint.apiKey}
-                placeholder="api key"
-                onChange={(event) => setNewEndpoint((prev) => ({ ...prev, apiKey: event.target.value }))}
-              />
-              <div className="modal-actions">
-                <button
-                  className="ghost-btn"
-                  disabled={submitting}
-                  onClick={() => setShowAddEndpointModal(false)}
-                  type="button"
-                >
-                  取消
-                </button>
-                <button disabled={submitting} type="submit">添加</button>
-              </div>
-            </form>
+                取消
+              </button>
+              <button
+                disabled={submitting || !draftChain.length}
+                onClick={() => {
+                  void handleSaveDraftChain();
+                }}
+                type="button"
+              >
+                保存
+              </button>
+            </div>
           </div>
         </div>
       )}

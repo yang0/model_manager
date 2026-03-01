@@ -1,5 +1,23 @@
 # model_manager 第一阶段文档（中文）
 
+> 说明（2026-03-01 更新）：当前代码已进入“简化模式”，仅保留 CLIProxy Local 单 endpoint。本文档记录第一阶段完整交付背景。
+
+## 0. 2026-03-01 增量更新（简化模式）
+
+- CLIProxy 模型列表新增额度展示能力：
+  - `额度`：优先显示 `quota_display` / `quota_remaining_fraction`
+  - `下次更新`：显示额度恢复/重置时间（如 `quota_reset_at`）
+- OAuth 额度来源：
+  - 通过 CLIProxy 管理端接口拉取 `auth-files`，再使用 `api-call` 调额度接口
+  - antigravity：`fetchAvailableModels`
+  - gemini-cli：`retrieveUserQuota`
+- 特殊规则：
+  - `iflow` provider 统一按“不限量”显示
+  - 前端过滤布尔型额度元信息（如 `quota_limited`），避免出现无意义的 `true/false`
+- 密钥来源优先级：
+  1. 已保存的 management secret（`smartRouting.signals.management.secretKeyEncrypted`）
+  2. 环境变量 `CLIPROXY_MANAGEMENT_KEY`
+
 ## 1. 阶段目标
 
 第一阶段目标是完成一个可本地运行的模型管理与 Claude Code 配置工具，覆盖：
@@ -112,4 +130,3 @@ npm run start -w backend
   - endpoint 级高级重试策略配置
   - 模型能力标注（工具调用/图像/长上下文）
   - 更细粒度的 Claude 模型键策略模板
-

@@ -8,11 +8,26 @@ import type {
   EndpointRecord,
   ModelRecord,
   ModelSource,
+  SmartRoutingConfig,
+  SmartRoutingGenerationConfig,
+  SmartRoutingInferenceSignalConfig,
+  SmartRoutingManagementSignalConfig,
+  SmartRoutingModelHealth,
+  SmartRoutingRuntimeState,
+  SmartRoutingSignalMode,
+  SmartRoutingSignalsConfig,
+  SmartRoutingVariablePolicy,
   StorageState,
   UpdateEndpointInput,
   UpsertManualModelInput,
 } from "@model-manager/shared";
-import { DEFAULT_POLLING_INTERVAL_SEC } from "./constants.js";
+import {
+  DEFAULT_POLLING_INTERVAL_SEC,
+  DEFAULT_SMART_ROUTING_INFERENCE_QUOTA_ERROR_THRESHOLD,
+  DEFAULT_SMART_ROUTING_INFERENCE_WINDOW_MIN,
+  DEFAULT_SMART_ROUTING_MANAGEMENT_BASE_URL,
+  DEFAULT_SMART_ROUTING_MANAGEMENT_POLL_SEC,
+} from "./constants.js";
 import { modelRecordId, normalizeBaseUrl, normalizePollingInterval, toIsoNow } from "./utils.js";
 
 interface DynamicModelInput {
@@ -28,13 +43,36 @@ interface UpdateSettingsInput {
   defaultPollingIntervalSec?: number;
 }
 
+const PERSISTED_DYNAMIC_META_KEYS = [
+  "performance_score",
+  "performance_tier",
+  "score_source",
+  "score_model_id",
+  "scored_at",
+  "quota_limited",
+  "quota_reason",
+] as const;
+
+function pickPersistedDynamicMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!meta) {
+    return {};
+  }
+  const result: Record<string, unknown> = {};
+  for (const key of PERSISTED_DYNAMIC_META_KEYS) {
+    if (key in meta) {
+      result[key] = meta[key];
+    }
+  }
+  return result;
+}
+
 function cloneState(state: StorageState): StorageState {
   return JSON.parse(JSON.stringify(state)) as StorageState;
 }
 
 function defaultState(defaultClaudeSettingsPath: string): StorageState {
   return {
-    version: 1,
+    version: 2,
     endpoints: [],
     models: [],
     settings: {
@@ -42,6 +80,7 @@ function defaultState(defaultClaudeSettingsPath: string): StorageState {
       autoRefresh: true,
       defaultPollingIntervalSec: DEFAULT_POLLING_INTERVAL_SEC,
     },
+    smartRouting: defaultSmartRoutingConfig(),
   };
 }
 
@@ -52,6 +91,255 @@ function normalizeSettings(input: Partial<AppSettings> | undefined, defaultClaud
       : defaultClaudeSettingsPath,
     autoRefresh: typeof input?.autoRefresh === "boolean" ? input.autoRefresh : true,
     defaultPollingIntervalSec: normalizePollingInterval(input?.defaultPollingIntervalSec),
+  };
+}
+
+function normalizeSmartRoutingPollSec(input?: number): number {
+  if (typeof input !== "number" || Number.isNaN(input)) {
+    return DEFAULT_SMART_ROUTING_MANAGEMENT_POLL_SEC;
+  }
+  if (input < 5) {
+    return 5;
+  }
+  if (input > 300) {
+    return 300;
+  }
+  return Math.floor(input);
+}
+
+function normalizeSmartRoutingWindowMin(input?: number): number {
+  if (typeof input !== "number" || Number.isNaN(input)) {
+    return DEFAULT_SMART_ROUTING_INFERENCE_WINDOW_MIN;
+  }
+  if (input < 1) {
+    return 1;
+  }
+  if (input > 120) {
+    return 120;
+  }
+  return Math.floor(input);
+}
+
+function normalizeSmartRoutingThreshold(input?: number): number {
+  if (typeof input !== "number" || Number.isNaN(input)) {
+    return DEFAULT_SMART_ROUTING_INFERENCE_QUOTA_ERROR_THRESHOLD;
+  }
+  if (input < 1) {
+    return 1;
+  }
+  if (input > 20) {
+    return 20;
+  }
+  return Math.floor(input);
+}
+
+function normalizeSignalMode(input: unknown): SmartRoutingSignalMode {
+  if (input === "management" || input === "inference" || input === "hybrid") {
+    return input;
+  }
+  return "hybrid";
+}
+
+function normalizeGenerationConfig(input: Partial<SmartRoutingGenerationConfig> | undefined): SmartRoutingGenerationConfig {
+  const defaultSystemPromptTemplate = "You are an expert model routing planner. Return strict JSON only.";
+  const defaultUserPromptTemplate = [
+    "Build independent model fallback priority list for each variable.",
+    "Each model includes: hasQuotaLimit(boolean), quotaLimitReason(string), performanceScore(0-100), performanceTier(high/medium/light).",
+    "Prefer higher performanceScore first, but ensure fallback path remains robust.",
+    "If high-tier limited models are exhausted, degrade to lower-tier models; keep at least one hasQuotaLimit=false model in tail fallback.",
+    "Output JSON: {\"variables\": {\"<key>\": [\"model1\",\"model2\"]}}",
+    "Routing payload:",
+    "{{payload_json}}",
+  ].join("\n");
+
+  return {
+    mode: input?.mode === "initial_only" || input?.mode === "always_before_switch" || input?.mode === "startup_and_model_change"
+      ? input.mode
+      : "startup_and_model_change",
+    generatorModelId: typeof input?.generatorModelId === "string" && input.generatorModelId.trim()
+      ? input.generatorModelId.trim()
+      : undefined,
+    systemPromptTemplate: typeof input?.systemPromptTemplate === "string" && input.systemPromptTemplate.trim()
+      ? input.systemPromptTemplate.trim()
+      : defaultSystemPromptTemplate,
+    userPromptTemplate: typeof input?.userPromptTemplate === "string" && input.userPromptTemplate.trim()
+      ? input.userPromptTemplate.trim()
+      : defaultUserPromptTemplate,
+  };
+}
+
+function normalizeManagementConfig(
+  input: Partial<SmartRoutingManagementSignalConfig> | undefined,
+): SmartRoutingManagementSignalConfig {
+  return {
+    baseUrl: normalizeBaseUrl(input?.baseUrl || DEFAULT_SMART_ROUTING_MANAGEMENT_BASE_URL),
+    pollSec: normalizeSmartRoutingPollSec(input?.pollSec),
+    secretKeyEncrypted: typeof input?.secretKeyEncrypted === "string" ? input.secretKeyEncrypted : undefined,
+  };
+}
+
+function normalizeInferenceConfig(
+  input: Partial<SmartRoutingInferenceSignalConfig> | undefined,
+): SmartRoutingInferenceSignalConfig {
+  return {
+    windowMin: normalizeSmartRoutingWindowMin(input?.windowMin),
+    quotaErrorThreshold: normalizeSmartRoutingThreshold(input?.quotaErrorThreshold),
+  };
+}
+
+function normalizeSignalsConfig(input: Partial<SmartRoutingSignalsConfig> | undefined): SmartRoutingSignalsConfig {
+  return {
+    mode: normalizeSignalMode(input?.mode),
+    management: normalizeManagementConfig(input?.management),
+    inference: normalizeInferenceConfig(input?.inference),
+  };
+}
+
+function normalizeVariablePolicy(input: unknown, keyHint: string): SmartRoutingVariablePolicy | null {
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+  const record = input as Partial<SmartRoutingVariablePolicy>;
+  const modelKey = typeof record.modelKey === "string" && record.modelKey.trim()
+    ? record.modelKey.trim()
+    : keyHint;
+  if (!modelKey) {
+    return null;
+  }
+  const dedup = new Set<string>();
+  const priorityList = Array.isArray(record.priorityList)
+    ? record.priorityList
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter((item) => {
+        if (!item || dedup.has(item)) {
+          return false;
+        }
+        dedup.add(item);
+        return true;
+      })
+    : [];
+  return {
+    modelKey,
+    priorityList,
+    currentModelId: typeof record.currentModelId === "string" && record.currentModelId.trim()
+      ? record.currentModelId.trim()
+      : undefined,
+    lastSwitchAt: typeof record.lastSwitchAt === "string" ? record.lastSwitchAt : undefined,
+    lastReason: typeof record.lastReason === "string" ? record.lastReason : undefined,
+    lockTop: typeof record.lockTop === "boolean" ? record.lockTop : false,
+  };
+}
+
+function normalizeRuntimeState(input: Partial<SmartRoutingRuntimeState> | undefined): SmartRoutingRuntimeState {
+  const healthByModelId: Record<string, SmartRoutingModelHealth> = {};
+  if (input?.healthByModelId && typeof input.healthByModelId === "object") {
+    for (const [modelId, value] of Object.entries(input.healthByModelId)) {
+      if (!value || typeof value !== "object") {
+        continue;
+      }
+      const item = value as Partial<SmartRoutingModelHealth>;
+      const state = item.state === "healthy" || item.state === "degraded" || item.state === "unknown"
+        ? item.state
+        : "unknown";
+      const source = item.source === "management" || item.source === "inference" || item.source === "mixed" || item.source === "none"
+        ? item.source
+        : "none";
+      healthByModelId[modelId] = {
+        state,
+        source,
+        reason: typeof item.reason === "string" ? item.reason : undefined,
+        updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : toIsoNow(),
+      };
+    }
+  }
+  return {
+    healthByModelId,
+    lastGenerationAt: typeof input?.lastGenerationAt === "string" ? input.lastGenerationAt : undefined,
+    lastGenerationSource: input?.lastGenerationSource === "ai" || input?.lastGenerationSource === "heuristic"
+      ? input.lastGenerationSource
+      : undefined,
+    lastGenerationChangedKeys: typeof input?.lastGenerationChangedKeys === "number"
+      && Number.isFinite(input.lastGenerationChangedKeys)
+      && input.lastGenerationChangedKeys >= 0
+      ? Math.floor(input.lastGenerationChangedKeys)
+      : undefined,
+    lastGenerationMessage: typeof input?.lastGenerationMessage === "string"
+      ? input.lastGenerationMessage
+      : undefined,
+    generationProcess: input?.generationProcess && typeof input.generationProcess === "object"
+      ? {
+        status: input.generationProcess.status === "running"
+          || input.generationProcess.status === "succeeded"
+          || input.generationProcess.status === "failed"
+          || input.generationProcess.status === "idle"
+          ? input.generationProcess.status
+          : "idle",
+        stage: typeof input.generationProcess.stage === "string" ? input.generationProcess.stage : undefined,
+        startedAt: typeof input.generationProcess.startedAt === "string" ? input.generationProcess.startedAt : undefined,
+        updatedAt: typeof input.generationProcess.updatedAt === "string" ? input.generationProcess.updatedAt : undefined,
+        finishedAt: typeof input.generationProcess.finishedAt === "string" ? input.generationProcess.finishedAt : undefined,
+        logs: Array.isArray(input.generationProcess.logs)
+          ? input.generationProcess.logs
+            .filter((item): item is string => typeof item === "string")
+            .slice(-80)
+          : [],
+      }
+      : {
+        status: "idle",
+        logs: [],
+      },
+    lastEvaluationAt: typeof input?.lastEvaluationAt === "string" ? input.lastEvaluationAt : undefined,
+    lastModelSignature: typeof input?.lastModelSignature === "string" ? input.lastModelSignature : undefined,
+    lastError: typeof input?.lastError === "string" ? input.lastError : undefined,
+  };
+}
+
+function defaultSmartRoutingConfig(): SmartRoutingConfig {
+  return {
+    enabled: true,
+    autoApplyToClaude: true,
+    generation: {
+      mode: "startup_and_model_change",
+    },
+    signals: {
+      mode: "hybrid",
+      management: {
+        baseUrl: DEFAULT_SMART_ROUTING_MANAGEMENT_BASE_URL,
+        pollSec: DEFAULT_SMART_ROUTING_MANAGEMENT_POLL_SEC,
+      },
+      inference: {
+        windowMin: DEFAULT_SMART_ROUTING_INFERENCE_WINDOW_MIN,
+        quotaErrorThreshold: DEFAULT_SMART_ROUTING_INFERENCE_QUOTA_ERROR_THRESHOLD,
+      },
+    },
+    variables: {},
+    runtime: {
+      healthByModelId: {},
+    },
+  };
+}
+
+function normalizeSmartRouting(input: Partial<SmartRoutingConfig> | undefined): SmartRoutingConfig {
+  const defaults = defaultSmartRoutingConfig();
+  const variables: Record<string, SmartRoutingVariablePolicy> = {};
+  if (input?.variables && typeof input.variables === "object") {
+    for (const [key, value] of Object.entries(input.variables)) {
+      const normalized = normalizeVariablePolicy(value, key);
+      if (normalized) {
+        variables[normalized.modelKey] = normalized;
+      }
+    }
+  }
+
+  return {
+    enabled: typeof input?.enabled === "boolean" ? input.enabled : defaults.enabled,
+    autoApplyToClaude: typeof input?.autoApplyToClaude === "boolean"
+      ? input.autoApplyToClaude
+      : defaults.autoApplyToClaude,
+    generation: normalizeGenerationConfig(input?.generation),
+    signals: normalizeSignalsConfig(input?.signals),
+    variables,
+    runtime: normalizeRuntimeState(input?.runtime),
   };
 }
 
@@ -146,10 +434,11 @@ export class DataStore {
     }
 
     return {
-      version: 1,
+      version: 2,
       endpoints,
       models,
       settings: normalizeSettings(input.settings, this.defaultClaudeSettingsPath),
+      smartRouting: normalizeSmartRouting(input.smartRouting),
     };
   }
 
@@ -194,6 +483,41 @@ export class DataStore {
   getEndpointModel(endpointId: string, modelId: string): ModelRecord | undefined {
     const item = this.state.models.find((model) => model.endpointId === endpointId && model.modelId === modelId);
     return item ? { ...item } : undefined;
+  }
+
+  async patchModelMetaBatch(patches: Array<{ id: string; metaPatch: Record<string, unknown> }>): Promise<ModelRecord[]> {
+    if (!patches.length) {
+      return [];
+    }
+    const now = toIsoNow();
+    const patchMap = new Map<string, Record<string, unknown>>();
+    for (const patch of patches) {
+      if (!patch?.id || !patch.metaPatch || typeof patch.metaPatch !== "object") {
+        continue;
+      }
+      patchMap.set(patch.id, patch.metaPatch);
+    }
+    if (!patchMap.size) {
+      return [];
+    }
+
+    const updated: ModelRecord[] = [];
+    for (const item of this.state.models) {
+      const patch = patchMap.get(item.id);
+      if (!patch) {
+        continue;
+      }
+      item.meta = {
+        ...(item.meta ?? {}),
+        ...patch,
+      };
+      item.updatedAt = now;
+      updated.push({ ...item });
+    }
+    if (updated.length) {
+      await this.persist();
+    }
+    return updated;
   }
 
   async createEndpoint(input: CreateEndpointInput, apiKeyEncrypted: string): Promise<EndpointRecord> {
@@ -266,6 +590,7 @@ export class DataStore {
     const previousMap = new Map(previous.map((item) => [item.modelId, item]));
     const nextDynamic = models.map((item) => {
       const existed = previousMap.get(item.modelId);
+      const preservedMeta = pickPersistedDynamicMeta(existed?.meta);
       return {
         id: modelRecordId(endpointId, "dynamic", item.modelId),
         endpointId,
@@ -276,7 +601,10 @@ export class DataStore {
         enabled: existed?.enabled ?? true,
         createdAt: existed?.createdAt ?? now,
         updatedAt: now,
-        meta: item.meta,
+        meta: {
+          ...(item.meta ?? {}),
+          ...preservedMeta,
+        },
       } satisfies ModelRecord;
     });
 
@@ -359,8 +687,57 @@ export class DataStore {
     await this.persist();
   }
 
+  async ensureSingleDynamicEndpoint(input: {
+    name: string;
+    baseUrl: string;
+    protocol?: EndpointProtocol;
+    pollingIntervalSec?: number;
+  }, apiKeyEncrypted: string): Promise<EndpointRecord> {
+    const now = toIsoNow();
+    const normalizedBaseUrl = normalizeBaseUrl(input.baseUrl);
+    const normalizedProtocol = normalizeEndpointProtocol(input.protocol);
+    const pollingIntervalSec = normalizePollingInterval(input.pollingIntervalSec);
+
+    const matched = this.state.endpoints.find(
+      (item) => item.name === input.name || normalizeBaseUrl(item.baseUrl) === normalizedBaseUrl,
+    );
+
+    const endpoint: EndpointRecord = {
+      id: matched?.id ?? randomUUID(),
+      name: input.name.trim(),
+      baseUrl: normalizedBaseUrl,
+      protocol: normalizedProtocol,
+      apiKeyEncrypted,
+      enabled: true,
+      dynamicEnabled: true,
+      pollingIntervalSec,
+      lastSyncAt: matched?.lastSyncAt,
+      lastSyncStatus: matched?.lastSyncStatus ?? "idle",
+      lastSyncError: matched?.lastSyncError,
+      createdAt: matched?.createdAt ?? now,
+      updatedAt: now,
+    };
+
+    this.state.endpoints = [endpoint];
+    this.state.models = this.state.models.filter(
+      (item) => item.endpointId === endpoint.id && item.source === "dynamic",
+    );
+    await this.persist();
+    return { ...endpoint };
+  }
+
   getSettings(): AppSettings {
     return { ...this.state.settings };
+  }
+
+  getSmartRouting(): SmartRoutingConfig {
+    return JSON.parse(JSON.stringify(this.state.smartRouting)) as SmartRoutingConfig;
+  }
+
+  async setSmartRouting(input: SmartRoutingConfig): Promise<SmartRoutingConfig> {
+    this.state.smartRouting = normalizeSmartRouting(input);
+    await this.persist();
+    return this.getSmartRouting();
   }
 
   async updateSettings(input: UpdateSettingsInput): Promise<AppSettings> {

@@ -1,5 +1,23 @@
 # model_manager Phase 1 Documentation (English)
 
+> Note (updated on 2026-03-01): the current codebase is now in a simplified mode that keeps only one endpoint (`CLIProxy Local`). This document records the original phase-1 delivery scope.
+
+## 0. Incremental Update (2026-03-01, simplified mode)
+
+- Added quota visibility in the CLIProxy model table:
+  - `Quota`: prefers `quota_display` / `quota_remaining_fraction`
+  - `Next update`: shows quota reset/recovery time (for example `quota_reset_at`)
+- OAuth quota data source:
+  - Reads CLIProxy management `auth-files`, then uses management `api-call` to query quota endpoints
+  - antigravity: `fetchAvailableModels`
+  - gemini-cli: `retrieveUserQuota`
+- Special handling:
+  - `iflow` provider is always displayed as unlimited
+  - Boolean quota flags (for example `quota_limited`) are filtered out in UI to avoid meaningless `true/false`
+- Management key source priority:
+  1. persisted management secret (`smartRouting.signals.management.secretKeyEncrypted`)
+  2. environment variable `CLIPROXY_MANAGEMENT_KEY`
+
 ## 1. Phase Goal
 
 Phase 1 delivers a local model manager and Claude Code config tool with:
@@ -114,4 +132,3 @@ npm run start -w backend
   - endpoint-level advanced retry policy
   - model capability tags (tool use / vision / long context)
   - richer templates for Claude model-key strategy
-
