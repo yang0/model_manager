@@ -678,7 +678,7 @@ function buildForwardHeaders(
 }
 
 async function proxyWithModelFallback(input: {
-  path: "/v1/messages" | "/v1/messages/count_tokens";
+  path: "/v1/messages" | "/v1/messages/count_tokens" | "/v1/chat/completions";
   method: "POST";
   request: FastifyRequest;
   reply: FastifyReply;
@@ -1261,6 +1261,19 @@ app.post("/v1/messages", async (request, reply) => {
 app.post("/v1/messages/count_tokens", async (request, reply) => {
   const result = await proxyWithModelFallback({
     path: "/v1/messages/count_tokens",
+    method: "POST",
+    request,
+    reply,
+  });
+  if (result) {
+    return result;
+  }
+  return undefined;
+});
+
+app.post("/v1/chat/completions", async (request, reply) => {
+  const result = await proxyWithModelFallback({
+    path: "/v1/chat/completions",
     method: "POST",
     request,
     reply,
