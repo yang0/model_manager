@@ -87,6 +87,58 @@ const GENEROUS_PROVIDER_PATTERNS = [/iflow/, /qwen/, /kimi/, /domestic/, /local/
 const GENEROUS_MODEL_PATTERNS = [/codex/, /gpt-5\.[23]/, /qwen/, /deepseek/, /glm/, /kimi/];
 const META_LIMITED_PATTERNS = [/quota/, /credit/, /balance/, /remaining/, /limit/, /usage/];
 const META_UNLIMITED_PATTERNS = [/unlimited/, /no[-_\s]?limit/, /unmetered/];
+const THINKING_REQUEST_KEYS = [
+  "thinking",
+  "thingking",
+  "reasoning",
+  "reasoning_effort",
+  "reasoningEffort",
+  "reasoning_budget_tokens",
+  "reasoningBudgetTokens",
+] as const;
+const THINKING_META_SUPPORT_KEYS = [
+  "supports_thinking",
+  "supportsThinking",
+  "thinking_supported",
+  "thinkingSupported",
+  "supports_reasoning",
+  "supportsReasoning",
+  "reasoning_supported",
+  "reasoningSupported",
+  "thinking",
+  "reasoning",
+] as const;
+const THINKING_POSITIVE_PATTERNS = [
+  /thinking/,
+  /reasoner|reasoning/,
+  /deepseek-r1/,
+  /qwen3-235b-a22b-thinking/,
+  /\bo1\b|\bo3\b/,
+  /gpt-5/,
+  /gemini-2\.5-pro/,
+  /gemini-3(\.1)?-pro/,
+];
+const THINKING_NEGATIVE_PATTERNS = [
+  /haiku/,
+  /flash-lite/,
+  /tab_flash_lite/,
+  /tab_jump_flash_lite/,
+  /mini|nano/,
+];
+const THINKING_RETRY_ERROR_PATTERNS = [
+  /unsupported.*thinking/,
+  /unsupported.*reasoning/,
+  /unknown.*thinking/,
+  /unknown.*reasoning/,
+  /invalid.*thinking/,
+  /invalid.*reasoning/,
+  /unexpected.*thinking/,
+  /unexpected.*reasoning/,
+  /not\s+support.*thinking/,
+  /not\s+support.*reasoning/,
+  /unrecognized.*thinking/,
+  /unrecognized.*reasoning/,
+];
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
@@ -192,6 +244,129 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function asNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function toBooleanLike(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const lower = value.trim().toLowerCase();
+    if (!lower) {
+      return undefined;
+    }
+    if (["true", "1", "yes", "enabled", "supported", "on"].includes(lower)) {
+      return true;
+    }
+    if (["false", "0", "no", "disabled", "unsupported", "off"].includes(lower)) {
+      return false;
+    }
+  }
+  return undefined;
+}
+
+function hasThinkingControlInput(body: Record<string, unknown>): boolean {
+  return THINKING_REQUEST_KEYS.some((key) => Object.prototype.hasOwnProperty.call(body, key));
+}
+
+function stripThinkingControlInput(body: Record<string, unknown>): void {
+  for (const key of THINKING_REQUEST_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) {
+      delete body[key];
+    }
+  }
+}
+
+function extractThinkingSupportFromMeta(model?: ModelRecord): boolean | undefined {
+  if (!model?.meta) {
+    return undefined;
+  }
+  const root = toObject(model.meta);
+  const candidates: Record<string, unknown>[] = [
+    root,
+    toObject(root.capabilities),
+    toObject(root.features),
+    toObject(root.metadata),
+  ];
+  for (const obj of candidates) {
+    for (const key of THINKING_META_SUPPORT_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+        continue;
+      }
+      const flag = toBooleanLike(obj[key]);
+      if (typeof flag === "boolean") {
+        return flag;
+      }
+    }
+  }
+
+  const capabilityTokens = new Set<string>();
+  const tokenSources: unknown[] = [
+    root.capabilities,
+    toObject(root.capabilities).list,
+    toObject(root.features).capabilities,
+  ];
+  for (const source of tokenSources) {
+    if (!Array.isArray(source)) {
+      continue;
+    }
+    for (const item of source) {
+      if (typeof item === "string" && item.trim()) {
+        capabilityTokens.add(item.trim().toLowerCase());
+      }
+    }
+  }
+  if (capabilityTokens.has("thinking") || capabilityTokens.has("reasoning")) {
+    return true;
+  }
+  return undefined;
+}
+
+function inferThinkingSupportByModelHeuristic(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  if (THINKING_NEGATIVE_PATTERNS.some((pattern) => pattern.test(lower))) {
+    return false;
+  }
+  if (THINKING_POSITIVE_PATTERNS.some((pattern) => pattern.test(lower))) {
+    return true;
+  }
+  return false;
+}
+
+function shouldForwardThinkingInput(model?: ModelRecord, modelId?: string): boolean {
+  const fromMeta = extractThinkingSupportFromMeta(model);
+  if (typeof fromMeta === "boolean") {
+    return fromMeta;
+  }
+  const targetModelId = (modelId || model?.modelId || "").trim();
+  if (!targetModelId) {
+    return false;
+  }
+  return inferThinkingSupportByModelHeuristic(targetModelId);
+}
+
+function shouldRetryWithoutThinking(status: number, bodyText: string): boolean {
+  if (status === 400 || status === 403 || status === 404 || status === 422) {
+    return true;
+  }
+  const lower = bodyText.toLowerCase();
+  return THINKING_RETRY_ERROR_PATTERNS.some((pattern) => pattern.test(lower));
+}
+
 function extractTextFromUnknown(value: unknown): string {
   if (typeof value === "string") {
     return value;
@@ -231,6 +406,164 @@ function extractJsonObject(text: string): Record<string, unknown> | null {
     }
     return null;
   }
+}
+
+function extractAssistantTextFromPayload(payload: Record<string, unknown>): string {
+  const content = payload.content;
+  if (Array.isArray(content)) {
+    const texts = content
+      .map((item) => {
+        const obj = toObject(item);
+        if (typeof obj.text === "string") {
+          return obj.text;
+        }
+        return extractTextFromUnknown(obj.content);
+      })
+      .filter((item): item is string => Boolean(item));
+    if (texts.length) {
+      return texts.join("");
+    }
+  }
+
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  if (choices.length) {
+    const first = toObject(choices[0]);
+    const message = toObject(first.message);
+    if (typeof message.content === "string") {
+      return message.content;
+    }
+    const msgArrayText = extractTextFromUnknown(message.content);
+    if (msgArrayText) {
+      return msgArrayText;
+    }
+    const delta = toObject(first.delta);
+    if (typeof delta.content === "string") {
+      return delta.content;
+    }
+    const deltaArrayText = extractTextFromUnknown(delta.content);
+    if (deltaArrayText) {
+      return deltaArrayText;
+    }
+  }
+
+  const outputText = asString(payload.output_text);
+  if (outputText) {
+    return outputText;
+  }
+
+  const message = toObject(payload.message);
+  if (typeof message.content === "string") {
+    return message.content;
+  }
+  return extractTextFromUnknown(message.content);
+}
+
+function extractUsageFromPayload(payload: Record<string, unknown>): { inputTokens: number; outputTokens: number } {
+  const usage = toObject(payload.usage);
+  const inputTokens = Math.max(0, Math.floor(asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens) ?? 0));
+  const outputTokens = Math.max(0, Math.floor(asNumber(usage.output_tokens) ?? asNumber(usage.completion_tokens) ?? 0));
+  return { inputTokens, outputTokens };
+}
+
+function normalizeAnthropicStopReason(payload: Record<string, unknown>): string {
+  const direct = asString(payload.stop_reason).trim();
+  if (direct) {
+    return direct;
+  }
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const first = toObject(choices[0]);
+  const finishReason = asString(first.finish_reason).trim().toLowerCase();
+  if (!finishReason) {
+    return "end_turn";
+  }
+  if (finishReason === "stop") {
+    return "end_turn";
+  }
+  if (finishReason === "length") {
+    return "max_tokens";
+  }
+  if (finishReason === "tool_calls" || finishReason === "function_call") {
+    return "tool_use";
+  }
+  return finishReason;
+}
+
+function splitStreamText(text: string, chunkSize = 32): string[] {
+  if (!text) {
+    return [""];
+  }
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += chunkSize) {
+    chunks.push(text.slice(i, i + chunkSize));
+  }
+  return chunks.length ? chunks : [""];
+}
+
+function encodeSseEvent(event: string, data: Record<string, unknown>): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function buildAnthropicSseFrames(payload: Record<string, unknown>, modelId: string): string[] {
+  const resolvedModel = asString(payload.model).trim() || modelId;
+  const messageId = asString(payload.id).trim() || `msg_${Date.now()}`;
+  const text = extractAssistantTextFromPayload(payload);
+  const stopReason = normalizeAnthropicStopReason(payload);
+  const usage = extractUsageFromPayload(payload);
+  const chunks = splitStreamText(text);
+
+  const frames: string[] = [];
+  frames.push(encodeSseEvent("message_start", {
+    type: "message_start",
+    message: {
+      id: messageId,
+      type: "message",
+      role: "assistant",
+      model: resolvedModel,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: {
+        input_tokens: usage.inputTokens,
+        output_tokens: 0,
+      },
+    },
+  }));
+  frames.push(encodeSseEvent("content_block_start", {
+    type: "content_block_start",
+    index: 0,
+    content_block: {
+      type: "text",
+      text: "",
+    },
+  }));
+  for (const chunk of chunks) {
+    frames.push(encodeSseEvent("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: {
+        type: "text_delta",
+        text: chunk,
+      },
+    }));
+  }
+  frames.push(encodeSseEvent("content_block_stop", {
+    type: "content_block_stop",
+    index: 0,
+  }));
+  frames.push(encodeSseEvent("message_delta", {
+    type: "message_delta",
+    delta: {
+      stop_reason: stopReason,
+      stop_sequence: null,
+    },
+    usage: {
+      output_tokens: usage.outputTokens,
+    },
+  }));
+  frames.push(encodeSseEvent("message_stop", {
+    type: "message_stop",
+  }));
+  return frames;
 }
 
 type ParsedScoreItem = {
@@ -650,10 +983,23 @@ function buildForwardHeaders(
   incomingHeaders: Record<string, unknown>,
   apiKey: string,
 ): Record<string, string> {
+  const blockedForwardHeaders = new Set([
+    "host",
+    "content-length",
+    "authorization",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "expect",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]);
   const headers: Record<string, string> = {};
   for (const [rawKey, rawValue] of Object.entries(incomingHeaders)) {
     const key = rawKey.toLowerCase();
-    if (key === "host" || key === "content-length" || key === "authorization" || key === "connection") {
+    if (blockedForwardHeaders.has(key)) {
       continue;
     }
     if (Array.isArray(rawValue)) {
@@ -700,8 +1046,10 @@ async function proxyWithModelFallback(input: {
     input.reply.code(400);
     return fail("Request body.model is required.");
   }
+  const shouldAdaptAnthropicStream = input.path === "/v1/messages" && bodyObj.stream === true;
 
   const allModels = store.listModels({ endpointId: endpoint.id });
+  const modelMapById = new Map(allModels.map((item) => [item.modelId, item]));
   const enabledModelIds = new Set(
     allModels.filter((item) => item.enabled).map((item) => item.modelId),
   );
@@ -741,52 +1089,160 @@ async function proxyWithModelFallback(input: {
   );
 
   const attempts: UpstreamAttemptResult[] = [];
+  const requestContainsThinkingInput = hasThinkingControlInput(bodyObj);
+  const sendSuccessfulResponse = async (
+    response: Response,
+    modelId: string,
+    fallbackCount: number,
+    thinkingForwardState: "none" | "kept" | "dropped",
+  ): Promise<void> => {
+    if (modelId !== requestedModelId) {
+      try {
+        await switchClaudeModelAfterFallback({
+          endpoint,
+          requestedModelId,
+          resolvedModelId: modelId,
+          enabledModelIds: allowedModelIds,
+          matchedModelKey: attemptPlan.modelKey,
+          requestedModelKeys,
+          configuredModelValues,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "unknown switch error";
+        console.warn(`[proxy] fallback switch apply failed: ${message}`);
+      }
+    }
+    console.log(
+      `[proxy] success model=${modelId} status=${response.status} fallbackCount=${fallbackCount}`,
+    );
+    input.reply.code(response.status);
+    input.reply.header("x-mm-proxy-model", modelId);
+    input.reply.header("x-mm-proxy-fallback-count", String(fallbackCount));
+    input.reply.header("x-mm-proxy-thinking", thinkingForwardState);
+    applyUpstreamHeaders(input.reply, response);
+
+    if (shouldAdaptAnthropicStream) {
+      const raw = await response.text();
+      let payload = raw ? extractJsonObject(raw) : null;
+      if (!payload) {
+        payload = {
+          id: `msg_${Date.now()}`,
+          model: modelId,
+          content: [{ type: "text", text: raw || "" }],
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+          },
+          stop_reason: "end_turn",
+        };
+      }
+      const sseFrames = buildAnthropicSseFrames(payload, modelId);
+      if (!sseFrames.length) {
+        sseFrames.push(
+          encodeSseEvent("message_start", { type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model: modelId, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }),
+          encodeSseEvent("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+          encodeSseEvent("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "" } }),
+          encodeSseEvent("content_block_stop", { type: "content_block_stop", index: 0 }),
+          encodeSseEvent("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }),
+          encodeSseEvent("message_stop", { type: "message_stop" }),
+        );
+      }
+      const ssePayload = sseFrames.join("");
+      input.reply.header("content-type", "text/event-stream; charset=utf-8");
+      input.reply.header("cache-control", "no-cache");
+      input.reply.header("x-mm-proxy-stream-adapter", "anthropic_messages");
+      input.reply.header("x-mm-proxy-sse-frames", String(sseFrames.length));
+      input.reply.send(ssePayload);
+      return;
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.toLowerCase().includes("text/event-stream") && response.body) {
+      const stream = Readable.fromWeb(response.body as unknown as NodeReadableStream<Uint8Array>);
+      input.reply.send(stream);
+      return;
+    }
+    const bodyBytes = Buffer.from(await response.arrayBuffer());
+    input.reply.send(bodyBytes);
+  };
   for (let index = 0; index < attemptModels.length; index += 1) {
     const modelId = attemptModels[index];
-    const upstreamBody = {
+    const upstreamBody: Record<string, unknown> = {
       ...bodyObj,
       model: modelId,
     };
+    let thinkingForwardState: "none" | "kept" | "dropped" = "none";
+    if (requestContainsThinkingInput) {
+      const targetModel = modelMapById.get(modelId);
+      if (shouldForwardThinkingInput(targetModel, modelId)) {
+        thinkingForwardState = "kept";
+      } else {
+        stripThinkingControlInput(upstreamBody);
+        thinkingForwardState = "dropped";
+        console.log(`[proxy] dropped thinking params for model=${modelId} (unsupported)`);
+      }
+    }
+    if (shouldAdaptAnthropicStream) {
+      upstreamBody.stream = false;
+    }
     try {
-      const response = await fetch(`${normalizeBaseUrl(endpoint.baseUrl)}${input.path}`, {
+      const doFetch = async (body: Record<string, unknown>) => fetch(`${normalizeBaseUrl(endpoint.baseUrl)}${input.path}`, {
         method: input.method,
         headers: buildForwardHeaders(input.request.headers, apiKey),
-        body: JSON.stringify(upstreamBody),
+        body: JSON.stringify(body),
       });
+      let response = await doFetch(upstreamBody);
 
-      if (response.ok) {
-        if (modelId !== requestedModelId) {
-          try {
-            await switchClaudeModelAfterFallback({
-              endpoint,
-              requestedModelId,
-              resolvedModelId: modelId,
-              enabledModelIds: allowedModelIds,
-              matchedModelKey: attemptPlan.modelKey,
-              requestedModelKeys,
-              configuredModelValues,
+      if (!response.ok && requestContainsThinkingInput && thinkingForwardState === "kept") {
+        const firstBodyText = await response.text();
+        if (shouldRetryWithoutThinking(response.status, firstBodyText)) {
+          const retryBody: Record<string, unknown> = { ...upstreamBody };
+          stripThinkingControlInput(retryBody);
+          thinkingForwardState = "dropped";
+          console.warn(`[proxy] retry without thinking model=${modelId} status=${response.status}`);
+          response = await doFetch(retryBody);
+          if (!response.ok) {
+            const bodyText = await response.text();
+            attempts.push({
+              modelId,
+              status: response.status,
+              bodySnippet: bodyText.slice(0, 400),
             });
-          } catch (error) {
-            const message = error instanceof Error ? error.message : "unknown switch error";
-            console.warn(`[proxy] fallback switch apply failed: ${message}`);
+            const retryNext = shouldTryNextModel(response.status, bodyText);
+            console.warn(
+              `[proxy] upstream failed model=${modelId} status=${response.status} retryNext=${retryNext}`,
+            );
+            if (!retryNext || index === attemptModels.length - 1) {
+              input.reply.code(response.status);
+              input.reply.header("content-type", response.headers.get("content-type") || "application/json; charset=utf-8");
+              input.reply.send(bodyText);
+              return;
+            }
+            continue;
           }
-        }
-        console.log(
-          `[proxy] success model=${modelId} status=${response.status} fallbackCount=${index}`,
-        );
-        input.reply.code(response.status);
-        input.reply.header("x-mm-proxy-model", modelId);
-        input.reply.header("x-mm-proxy-fallback-count", String(index));
-        applyUpstreamHeaders(input.reply, response);
-
-        const contentType = response.headers.get("content-type") || "";
-        if (contentType.toLowerCase().includes("text/event-stream") && response.body) {
-          const stream = Readable.fromWeb(response.body as unknown as NodeReadableStream<Uint8Array>);
-          input.reply.send(stream);
+          await sendSuccessfulResponse(response, modelId, index, thinkingForwardState);
           return;
         }
-        const bodyBytes = Buffer.from(await response.arrayBuffer());
-        input.reply.send(bodyBytes);
+        attempts.push({
+          modelId,
+          status: response.status,
+          bodySnippet: firstBodyText.slice(0, 400),
+        });
+        const retryNext = shouldTryNextModel(response.status, firstBodyText);
+        console.warn(
+          `[proxy] upstream failed model=${modelId} status=${response.status} retryNext=${retryNext}`,
+        );
+        if (!retryNext || index === attemptModels.length - 1) {
+          input.reply.code(response.status);
+          input.reply.header("content-type", response.headers.get("content-type") || "application/json; charset=utf-8");
+          input.reply.send(firstBodyText);
+          return;
+        }
+        continue;
+      }
+
+      if (response.ok) {
+        await sendSuccessfulResponse(response, modelId, index, thinkingForwardState);
         return;
       }
 
@@ -808,6 +1264,52 @@ async function proxyWithModelFallback(input: {
         return;
       }
     } catch (error) {
+      if (requestContainsThinkingInput && thinkingForwardState === "kept") {
+        try {
+          const retryBody: Record<string, unknown> = { ...upstreamBody };
+          stripThinkingControlInput(retryBody);
+          thinkingForwardState = "dropped";
+          console.warn(`[proxy] network retry without thinking model=${modelId}`);
+          const retryResponse = await fetch(`${normalizeBaseUrl(endpoint.baseUrl)}${input.path}`, {
+            method: input.method,
+            headers: buildForwardHeaders(input.request.headers, apiKey),
+            body: JSON.stringify(retryBody),
+          });
+          if (retryResponse.ok) {
+            await sendSuccessfulResponse(retryResponse, modelId, index, thinkingForwardState);
+            return;
+          }
+          const retryBodyText = await retryResponse.text();
+          attempts.push({
+            modelId,
+            status: retryResponse.status,
+            bodySnippet: retryBodyText.slice(0, 400),
+          });
+          const retryNext = shouldTryNextModel(retryResponse.status, retryBodyText);
+          console.warn(
+            `[proxy] upstream failed model=${modelId} status=${retryResponse.status} retryNext=${retryNext}`,
+          );
+          if (!retryNext || index === attemptModels.length - 1) {
+            input.reply.code(retryResponse.status);
+            input.reply.header("content-type", retryResponse.headers.get("content-type") || "application/json; charset=utf-8");
+            input.reply.send(retryBodyText);
+            return;
+          }
+          continue;
+        } catch (retryError) {
+          const retryMessage = retryError instanceof Error ? retryError.message : "Network error";
+          attempts.push({
+            modelId,
+            error: retryMessage,
+          });
+          console.warn(`[proxy] request error model=${modelId} error=${retryMessage}`);
+          if (index === attemptModels.length - 1) {
+            input.reply.code(502);
+            return fail(`All fallback attempts failed: ${retryMessage}`);
+          }
+          continue;
+        }
+      }
       const message = error instanceof Error ? error.message : "Network error";
       attempts.push({
         modelId,
