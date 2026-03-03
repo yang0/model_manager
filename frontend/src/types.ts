@@ -55,7 +55,6 @@ export interface ClaudeCurrentState {
   env: {
     ANTHROPIC_BASE_URL?: string;
     hasAuthToken: boolean;
-    ANTHROPIC_AUTH_TOKEN: string;
     ANTHROPIC_AUTH_TOKEN_MASKED: string;
     modelValues: Record<string, string>;
     modelKeys: string[];

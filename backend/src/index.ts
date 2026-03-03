@@ -44,11 +44,6 @@ const CLAUDE_MODEL_KEYS = [
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
   "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
-const PROXY_MODEL_KEY = "proxy_model";
-const DEFAULT_FALLBACK_MODEL_KEYS = [
-  ...CLAUDE_MODEL_KEYS,
-  PROXY_MODEL_KEY,
-];
 const HIGH_SCORE_PATTERNS = [
   /opus/,
   /gpt-5/,
@@ -461,33 +456,6 @@ function fail(message: string): ApiResult<never> {
   return { ok: false, error: message };
 }
 
-function buildPythonInvokeExample(modelId: string): string {
-  const safeModelId = modelId.trim() || "your-model-id";
-  return [
-    "import requests",
-    "",
-    `base_url = ${JSON.stringify(MODEL_MANAGER_PROXY_BASE_URL)}`,
-    `model_id = ${JSON.stringify(safeModelId)}`,
-    "",
-    "payload = {",
-    "    \"model\": model_id,",
-    "    \"max_tokens\": 256,",
-    "    \"messages\": [",
-    "        {\"role\": \"user\", \"content\": \"Hello, introduce yourself briefly.\"}",
-    "    ]",
-    "}",
-    "",
-    "response = requests.post(",
-    "    f\"{base_url}/v1/messages\",",
-    "    headers={\"Content-Type\": \"application/json\"},",
-    "    json=payload,",
-    "    timeout=60,",
-    ")",
-    "response.raise_for_status()",
-    "print(response.json())",
-  ].join("\n");
-}
-
 type FallbackChainView = {
   modelKey: string;
   currentModelId?: string;
@@ -526,7 +494,9 @@ function buildFallbackCandidateKeys(
 ): string[] {
   return Array.from(new Set([
     ...(preferredModelKeys ?? []),
-    ...DEFAULT_FALLBACK_MODEL_KEYS,
+    "model",
+    "ANTHROPIC_MODEL",
+    ...CLAUDE_MODEL_KEYS,
     ...Object.keys(config.variables).sort((a, b) => a.localeCompare(b)),
   ]));
 }
@@ -541,20 +511,6 @@ function buildFallbackAttemptPlan(
   if (!requested) {
     return { modelIds: [] };
   }
-
-  if (requested === PROXY_MODEL_KEY || !allowedModelIds.has(requested)) {
-    const directPolicy = config.variables[requested];
-    if (directPolicy?.priorityList?.length) {
-      const directList = normalizeModelIdList(directPolicy.priorityList, allowedModelIds);
-      if (directList.length) {
-        return {
-          modelKey: requested,
-          modelIds: directList,
-        };
-      }
-    }
-  }
-
   const candidateKeys = buildFallbackCandidateKeys(config, preferredModelKeys);
 
   if (!allowedModelIds.has(requested)) {
@@ -845,6 +801,9 @@ async function switchClaudeModelAfterFallback(input: {
     return;
   }
   const apiKey = decryptSecretWithDpapi(input.endpoint.apiKeyEncrypted);
+  if (!apiKey) {
+    return;
+  }
   const settingsPath = store.getSettings().claudeSettingsPath;
   const nowIso = new Date().toISOString();
 
@@ -875,31 +834,25 @@ async function switchClaudeModelAfterFallback(input: {
     const nextModelId = enabledPriority.includes(input.resolvedModelId)
       ? input.resolvedModelId
       : enabledPriority[0];
-    const shouldApplyClaude = key !== PROXY_MODEL_KEY;
-    const alreadyConfigured = shouldApplyClaude ? configuredModelId === nextModelId : true;
+    const alreadyConfigured = configuredModelId === nextModelId;
     const policyAlreadyCurrent = currentModelId === nextModelId;
     if (!nextModelId || (policyAlreadyCurrent && alreadyConfigured)) {
       continue;
     }
 
-    if (shouldApplyClaude) {
-      if (!apiKey) {
-        continue;
-      }
-      await applyClaudeSettings({
-        settingsPath,
-        baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
-        apiKey,
-        modelId: nextModelId,
-        modelKey: key,
-      });
-    }
+    await applyClaudeSettings({
+      settingsPath,
+      baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
+      apiKey,
+      modelId: nextModelId,
+      modelKey: key,
+    });
 
     policy.currentModelId = nextModelId;
     policy.lastSwitchAt = nowIso;
     policy.lastReason = `proxy_fallback:${input.requestedModelId}->${nextModelId}`;
     changed = true;
-    console.log(`[proxy] switched key=${key} model=${nextModelId}`);
+    console.log(`[proxy] switched claude key=${key} model=${nextModelId}`);
   }
 
   if (changed) {
@@ -935,6 +888,10 @@ async function reconcileClaudeModelByStatus(input: {
   }
 
   const apiKey = decryptSecretWithDpapi(input.endpoint.apiKeyEncrypted);
+  if (!apiKey) {
+    return 0;
+  }
+
   const settingsPath = store.getSettings().claudeSettingsPath;
   const nowIso = new Date().toISOString();
   let changedCount = 0;
@@ -954,18 +911,13 @@ async function reconcileClaudeModelByStatus(input: {
       continue;
     }
 
-    if (key !== PROXY_MODEL_KEY) {
-      if (!apiKey) {
-        continue;
-      }
-      await applyClaudeSettings({
-        settingsPath,
-        baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
-        apiKey,
-        modelId: desiredModelId,
-        modelKey: key,
-      });
-    }
+    await applyClaudeSettings({
+      settingsPath,
+      baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
+      apiKey,
+      modelId: desiredModelId,
+      modelKey: key,
+    });
 
     policy.currentModelId = desiredModelId;
     policy.lastSwitchAt = nowIso;
@@ -1146,27 +1098,6 @@ app.get("/api/models", async (request) => {
     })
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
   return ok(models);
-});
-
-app.get("/api/models/quickstart", async (request) => {
-  const endpoint = store.listEndpoints()[0];
-  const query = request.query as { source?: ModelSource };
-  const models = endpoint
-    ? store
-      .listModels({
-        endpointId: endpoint.id,
-        source: query.source === "dynamic" || query.source === "manual" ? query.source : undefined,
-      })
-      .sort((a, b) => a.displayName.localeCompare(b.displayName))
-    : [];
-  const preferredModelId = models.find((item) => item.enabled)?.modelId ?? models[0]?.modelId ?? "your-model-id";
-
-  return ok({
-    listModelsApi: "/api/models",
-    invokeApi: "/v1/messages",
-    models,
-    pythonExample: buildPythonInvokeExample(preferredModelId),
-  });
 });
 
 app.put("/api/models/:id/enabled", async (request, reply) => {
@@ -1459,7 +1390,7 @@ app.get("/api/fallback-chains", async (request, reply) => {
     const current = await readClaudeSettings(settingsPath);
     const config = store.getSmartRouting();
     const modelKeys = Array.from(new Set([
-      ...DEFAULT_FALLBACK_MODEL_KEYS,
+      ...CLAUDE_MODEL_KEYS,
       ...Object.keys(current.env.modelValues),
       ...Object.keys(config.variables),
     ])).sort((a, b) => a.localeCompare(b));
@@ -1524,17 +1455,15 @@ app.put("/api/fallback-chains/:modelKey", async (request, reply) => {
       reply.code(400);
       return fail("First model in priorityList is not available.");
     }
-    if (modelKey !== PROXY_MODEL_KEY) {
-      const apiKey = decryptSecretWithDpapi(endpoint.apiKeyEncrypted);
-      const settingsPath = store.getSettings().claudeSettingsPath;
-      await applyClaudeSettings({
-        settingsPath,
-        baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
-        apiKey,
-        modelId: targetModelId,
-        modelKey,
-      });
-    }
+    const apiKey = decryptSecretWithDpapi(endpoint.apiKeyEncrypted);
+    const settingsPath = store.getSettings().claudeSettingsPath;
+    await applyClaudeSettings({
+      settingsPath,
+      baseUrl: MODEL_MANAGER_PROXY_BASE_URL,
+      apiKey,
+      modelId: targetModelId,
+      modelKey,
+    });
 
     const config = store.getSmartRouting();
     const existing = config.variables[modelKey];
@@ -1584,7 +1513,6 @@ app.get("/api/claude/current", async () => {
     env: {
       ANTHROPIC_BASE_URL: current.env.ANTHROPIC_BASE_URL,
       hasAuthToken: Boolean(current.env.ANTHROPIC_AUTH_TOKEN),
-      ANTHROPIC_AUTH_TOKEN: current.env.ANTHROPIC_AUTH_TOKEN || "",
       ANTHROPIC_AUTH_TOKEN_MASKED: current.env.ANTHROPIC_AUTH_TOKEN
         ? maskSecret(current.env.ANTHROPIC_AUTH_TOKEN)
         : "",

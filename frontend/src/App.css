@@ -233,26 +233,6 @@
   padding: 0;
 }
 
-.fallback-chip .fallback-chip-select {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.38rem;
-  border: none;
-  background: transparent;
-  color: inherit;
-  font-size: inherit;
-  padding: 0;
-}
-
-.fallback-chip .fallback-chip-select:not(:disabled) {
-  cursor: pointer;
-}
-
-.fallback-chip .fallback-chip-select:disabled {
-  cursor: not-allowed;
-  opacity: 0.75;
-}
-
 .model-settings-table-wrap {
   max-height: 620px;
 }

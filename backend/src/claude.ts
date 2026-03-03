@@ -31,10 +31,6 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function stripUtf8Bom(raw: string): string {
-  return raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
-}
-
 export async function detectDefaultClaudeSettingsPath(): Promise<string> {
   const candidate = path.join(os.homedir(), ".claude", "settings.json");
   try {
@@ -55,8 +51,7 @@ export async function applyClaudeSettings(input: ApplyClaudeConfigInput): Promis
 
   try {
     existingRaw = await fs.readFile(absolutePath, "utf8");
-    const normalized = stripUtf8Bom(existingRaw);
-    const maybeJson: unknown = normalized.trim() ? JSON.parse(normalized) : {};
+    const maybeJson: unknown = existingRaw.trim() ? JSON.parse(existingRaw) : {};
     if (!isObject(maybeJson)) {
       throw new Error("Claude settings must be a JSON object.");
     }
@@ -107,8 +102,7 @@ export async function readClaudeSettings(settingsPath: string): Promise<ClaudeCu
   const absolutePath = path.resolve(expandHome(settingsPath));
   try {
     const raw = await fs.readFile(absolutePath, "utf8");
-    const normalized = stripUtf8Bom(raw);
-    const parsedUnknown: unknown = normalized.trim() ? JSON.parse(normalized) : {};
+    const parsedUnknown: unknown = raw.trim() ? JSON.parse(raw) : {};
     const parsed = isObject(parsedUnknown) ? parsedUnknown : {};
     const envUnknown = parsed.env;
     const envObj = isObject(envUnknown) ? envUnknown : {};

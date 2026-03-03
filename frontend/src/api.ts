@@ -9,10 +9,6 @@ import type {
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
 
-function stripUtf8Bom(raw: string): string {
-  return raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
-}
-
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers ?? {});
   if (options?.body !== undefined && !headers.has("Content-Type")) {
@@ -24,7 +20,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     headers,
   });
 
-  const raw = stripUtf8Bom(await response.text());
+  const raw = await response.text();
   let payload: ApiResult<T> | null = null;
   try {
     payload = raw ? (JSON.parse(raw) as ApiResult<T>) : null;
