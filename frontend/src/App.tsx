@@ -25,9 +25,10 @@ type MessageState = {
   text: string;
 } | null;
 
-type MenuKey = "home" | "cliproxy";
+type MenuKey = "home" | "proxy_model" | "cliproxy";
 
 const CLIPROXY_LOCAL_NAME = "CLIProxy Local";
+const PROXY_MODEL_KEY = "proxy_model";
 const DEFAULT_MODEL_KEYS = [
   "model",
   "ANTHROPIC_MODEL",
@@ -35,6 +36,7 @@ const DEFAULT_MODEL_KEYS = [
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
   "CLAUDE_CODE_SUBAGENT_MODEL",
+  PROXY_MODEL_KEY,
 ];
 const QUOTA_PRIMARY_KEYS = [
   "quota_display",
@@ -519,6 +521,29 @@ function App() {
   }, [partiallyDraftModelsSelected]);
 
   const variableKeys = useMemo(() => normalizeVariableKeys(claudeCurrent, fallbackChains), [claudeCurrent, fallbackChains]);
+  const claudeVariableKeys = useMemo(
+    () => variableKeys.filter((key) => key !== PROXY_MODEL_KEY),
+    [variableKeys],
+  );
+  const proxyModelChain = fallbackChains[PROXY_MODEL_KEY] ?? [];
+  const proxyModelCurrent = fallbackCurrentByKey[PROXY_MODEL_KEY] || proxyModelChain[0] || "未设置";
+  const proxyClientBaseUrl = claudeCurrent?.env.ANTHROPIC_BASE_URL?.trim() || "http://127.0.0.1:3199";
+  const proxyClientApiKey = claudeCurrent?.env.ANTHROPIC_AUTH_TOKEN || "";
+  const proxyClientInvokeApi = "/v1/messages";
+  const proxyClientCurlExample = useMemo(() => {
+    const apiKey = proxyClientApiKey || "<your-api-key>";
+    return [
+      `curl -X POST "${proxyClientBaseUrl}${proxyClientInvokeApi}" \\`,
+      "  -H \"content-type: application/json\" \\",
+      "  -H \"anthropic-version: 2023-06-01\" \\",
+      `  -H "x-api-key: ${apiKey}" \\`,
+      "  -d '{",
+      `    \"model\": \"${PROXY_MODEL_KEY}\",`,
+      "    \"max_tokens\": 256,",
+      "    \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]",
+      "  }'",
+    ].join("\n");
+  }, [proxyClientApiKey, proxyClientBaseUrl, proxyClientInvokeApi]);
 
   const currentModelEntries = useMemo(() => {
     const keys = claudeCurrent?.env.modelKeys ?? [];
@@ -541,7 +566,7 @@ function App() {
       },
       {
         key: "当前 Token",
-        value: claudeCurrent?.env.ANTHROPIC_AUTH_TOKEN_MASKED || "未配置",
+        value: claudeCurrent?.env.ANTHROPIC_AUTH_TOKEN || "未配置",
       },
     ];
     for (const item of currentModelEntries) {
@@ -866,6 +891,33 @@ function App() {
     }
   };
 
+  const handleSetFallbackCurrentModel = async (modelKey: string, modelId: string) => {
+    const chain = fallbackChains[modelKey] ?? [];
+    if (!chain.includes(modelId)) {
+      return;
+    }
+
+    const target = modelMap.get(modelId);
+    if (!target || !target.enabled) {
+      return;
+    }
+
+    const next = [modelId, ...chain.filter((item) => item !== modelId)];
+    const current = fallbackCurrentByKey[modelKey] || chain[0] || "";
+    if (next[0] === current && chain.length === next.length && chain.every((item, index) => item === next[index])) {
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      await persistChain(modelKey, next, `已将 ${modelKey} 当前模型切换为 ${modelId}，并自动更新 Claude 配置。`);
+    } catch (error) {
+      setError(error);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="app-shell">
@@ -890,6 +942,13 @@ function App() {
             type="button"
           >
             首页
+          </button>
+          <button
+            className={activeMenu === "proxy_model" ? "menu-item active" : "menu-item"}
+            onClick={() => setActiveMenu("proxy_model")}
+            type="button"
+          >
+            通用代理模型
           </button>
           <button
             className={activeMenu === "cliproxy" ? "menu-item active" : "menu-item"}
@@ -937,7 +996,7 @@ function App() {
               ))}
             </div>
 
-            {variableKeys.map((modelKey) => {
+            {claudeVariableKeys.map((modelKey) => {
               const chain = fallbackChains[modelKey] ?? [];
               const current = fallbackCurrentByKey[modelKey] || chain[0] || "未设置";
               return (
@@ -961,36 +1020,147 @@ function App() {
                   <div className="fallback-line">
                     <div className="config-key">Fallback Chain</div>
                     <div className="fallback-chip-list">
-                      {chain.length ? chain.map((modelId) => (
-                        <span
-                          className={[
-                            "fallback-chip",
-                            modelMap.get(modelId)?.enabled === false ? "is-disabled" : "is-enabled",
-                            current === modelId ? "is-current" : "",
-                          ]
-                            .filter(Boolean)
-                            .join(" ")}
-                          key={`${modelKey}:${modelId}`}
-                        >
-                          <span>{modelId}</span>
-                          {current === modelId ? <em className="current-check" title="当前模型">✓</em> : null}
-                          <button
-                            disabled={submitting || chain.length <= 1}
-                            onClick={() => {
-                              void handleRemoveFallbackModel(modelKey, modelId);
-                            }}
-                            title="移除"
-                            type="button"
+                      {chain.length ? chain.map((modelId) => {
+                        const model = modelMap.get(modelId);
+                        const disabled = model?.enabled === false;
+                        return (
+                          <span
+                            className={[
+                              "fallback-chip",
+                              disabled ? "is-disabled" : "is-enabled",
+                              current === modelId ? "is-current" : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
+                            key={`${modelKey}:${modelId}`}
                           >
-                            ×
-                          </button>
-                        </span>
-                      )) : <span className="muted">未设置</span>}
+                            <button
+                              className="fallback-chip-select"
+                              disabled={submitting || disabled}
+                              onClick={() => {
+                                void handleSetFallbackCurrentModel(modelKey, modelId);
+                              }}
+                              title={disabled ? "模型已禁用，无法设为当前模型" : "点击设为当前模型"}
+                              type="button"
+                            >
+                              <span>{modelId}</span>
+                              {current === modelId ? <em className="current-check" title="当前模型">✓</em> : null}
+                            </button>
+                            <button
+                              disabled={submitting || chain.length <= 1}
+                              onClick={() => {
+                                void handleRemoveFallbackModel(modelKey, modelId);
+                              }}
+                              title="移除"
+                              type="button"
+                            >
+                              ×
+                            </button>
+                          </span>
+                        );
+                      }) : <span className="muted">未设置</span>}
                     </div>
                   </div>
                 </div>
               );
             })}
+          </section>
+        )}
+
+        {activeMenu === "proxy_model" && (
+          <section className="content-card">
+            <h2>通用代理模型（proxy_model）</h2>
+            <div className="mechanism-note">
+              <div className="mechanism-title">使用说明</div>
+              <ul>
+                <li>调用方式保持 Anthropic 模式不变，仍走 `POST /v1/messages`。</li>
+                <li>客户端把 `model` 固定传 `proxy_model`，服务端按这里的 fallback chain 自动切换。</li>
+                <li>该链独立于 Claude 各变量链，不会回写 Claude 的 `model`/`env.*MODEL*` 字段。</li>
+              </ul>
+            </div>
+            <div className="config-lines">
+              <div className="config-line">
+                <div className="config-key">Base URL</div>
+                <div className="config-value">{proxyClientBaseUrl}</div>
+              </div>
+              <div className="config-line">
+                <div className="config-key">API Key</div>
+                <div className="config-value">{proxyClientApiKey || "未配置"}</div>
+              </div>
+              <div className="config-line">
+                <div className="config-key">Model</div>
+                <div className="config-value">{PROXY_MODEL_KEY}</div>
+              </div>
+              <div className="config-line">
+                <div className="config-key">Invoke API</div>
+                <div className="config-value">{proxyClientInvokeApi}</div>
+              </div>
+            </div>
+            <pre className="code-block">{proxyClientCurlExample}</pre>
+            <p className="muted">如果你的 SDK 必填 API Key，这里使用上面的值；本地代理模式下不会用它向上游鉴权。</p>
+
+            <div className="home-row-block" key={PROXY_MODEL_KEY}>
+              <div className="config-row">
+                <label>{PROXY_MODEL_KEY}</label>
+                <div className="variable-head">
+                  <span className="variable-current">当前: {proxyModelCurrent}</span>
+                  <button
+                    disabled={submitting || !models.length}
+                    onClick={() => {
+                      openSettingsModal(PROXY_MODEL_KEY);
+                    }}
+                    type="button"
+                  >
+                    设置
+                  </button>
+                </div>
+              </div>
+
+              <div className="fallback-line">
+                <div className="config-key">Fallback Chain</div>
+                <div className="fallback-chip-list">
+                  {proxyModelChain.length ? proxyModelChain.map((modelId) => {
+                    const model = modelMap.get(modelId);
+                    const disabled = model?.enabled === false;
+                    return (
+                      <span
+                        className={[
+                          "fallback-chip",
+                          disabled ? "is-disabled" : "is-enabled",
+                          proxyModelCurrent === modelId ? "is-current" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                        key={`${PROXY_MODEL_KEY}:${modelId}`}
+                      >
+                        <button
+                          className="fallback-chip-select"
+                          disabled={submitting || disabled}
+                          onClick={() => {
+                            void handleSetFallbackCurrentModel(PROXY_MODEL_KEY, modelId);
+                          }}
+                          title={disabled ? "模型已禁用，无法设为当前模型" : "点击设为当前模型"}
+                          type="button"
+                        >
+                          <span>{modelId}</span>
+                          {proxyModelCurrent === modelId ? <em className="current-check" title="当前模型">✓</em> : null}
+                        </button>
+                        <button
+                          disabled={submitting || proxyModelChain.length <= 1}
+                          onClick={() => {
+                            void handleRemoveFallbackModel(PROXY_MODEL_KEY, modelId);
+                          }}
+                          title="移除"
+                          type="button"
+                        >
+                          ×
+                        </button>
+                      </span>
+                    );
+                  }) : <span className="muted">未设置</span>}
+                </div>
+              </div>
+            </div>
           </section>
         )}
 

@@ -72,6 +72,10 @@ function cloneState(state: StorageState): StorageState {
   return JSON.parse(JSON.stringify(state)) as StorageState;
 }
 
+function stripUtf8Bom(raw: string): string {
+  return raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
+}
+
 function defaultState(defaultClaudeSettingsPath: string): StorageState {
   return {
     version: 2,
@@ -367,7 +371,7 @@ export class DataStore {
     await fs.mkdir(path.dirname(this.storagePath), { recursive: true });
     try {
       const raw = await fs.readFile(this.storagePath, "utf8");
-      const parsed = JSON.parse(raw) as Partial<StorageState>;
+      const parsed = JSON.parse(stripUtf8Bom(raw)) as Partial<StorageState>;
       this.state = this.normalizeState(parsed);
     } catch (error) {
       const err = error as NodeJS.ErrnoException;

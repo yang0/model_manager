@@ -9,6 +9,7 @@
 
 - 中文一期文档：`docs/PHASE1_ZH.md`
 - English phase-1 doc: `docs/PHASE1_EN.md`
+- 通用代理模型（proxy_model）使用说明：`docs/PROXY_MODEL_ZH.md`
 
 ## 核心功能（当前实现）
 
@@ -25,6 +26,10 @@
 - Fallback Chain 运行时自动切换：
   - 请求失败后按 chain 尝试可用模型
   - 成功切换后自动回写 Claude 配置与当前模型
+- 通用代理模型 `proxy_model`（Anthropic 调用模式不变）：
+  - 客户端可固定 `model=proxy_model` 调用 `/v1/messages`
+  - `proxy_model` 使用独立 fallback chain（WebUI 独立菜单）
+  - `proxy_model` 的切换仅更新内部路由状态，不回写 Claude 的 `model/env.*MODEL*`
 - 模型状态管理：
   - 自动：有限额且额度耗尽时禁用，额度恢复后重新启用
   - 手动：支持在模型列表中点击启用/禁用（带状态覆盖）
@@ -98,6 +103,7 @@ npm run build
 - `GET /api/endpoints/cliproxy-config`
 - `POST /api/endpoints/:id/refresh`
 - `GET /api/models`
+- `GET /api/models/quickstart`
 - `PUT /api/models/:id/enabled`
 - `POST /api/models/score`
 - `GET /api/fallback-chains`
