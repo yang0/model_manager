@@ -23,7 +23,6 @@
   - `GET /v1/models`
   - `POST /v1/messages`
   - `POST /v1/messages/count_tokens`
-  - `POST /v1/chat/completions`
 - Fallback Chain 运行时自动切换：
   - 请求失败后按 chain 尝试可用模型
   - 成功切换后自动回写 Claude 配置与当前模型
@@ -31,9 +30,6 @@
   - 客户端可固定 `model=proxy_model` 调用 `/v1/messages`
   - `proxy_model` 使用独立 fallback chain（WebUI 独立菜单）
   - `proxy_model` 的切换仅更新内部路由状态，不回写 Claude 的 `model/env.*MODEL*`
-  - 请求含 `thinking/thingking/reasoning` 参数时会智能判断模型能力：支持则透传，不支持则自动剔除
-  - 若初次判断支持但上游返回不支持错误，会对同一模型自动“去 thinking 重试”一次
-  - 流式 `POST /v1/messages`（`stream: true`）会输出 Anthropic SSE 事件序列，兼容 OpenClaw
 - 模型状态管理：
   - 自动：有限额且额度耗尽时禁用，额度恢复后重新启用
   - 手动：支持在模型列表中点击启用/禁用（带状态覆盖）
@@ -120,4 +116,3 @@ npm run build
 - `GET /v1/models`
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
-- `POST /v1/chat/completions`
